@@ -1,0 +1,8 @@
+.git
+.env
+expenses.db
+__pycache__
+*.pyc
+test_bot.py
+PRD.md
+README.md
