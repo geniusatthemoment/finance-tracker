@@ -176,6 +176,95 @@ class StorageTest(unittest.TestCase):
         self.assertEqual(details["total"], 85000)
         self.assertIsNone(bot.expense_details(2, expense_id))
 
+    def test_specific_expense_can_be_replaced_and_deleted(self):
+        day = date(2026, 9, 24)
+        bot.save_expenses(1, [("Еда", "старый", 50000)], day)
+        expense_id = bot.recent_expenses(1)[0]["id"]
+        replacement = ("Транспорт", "такси", 70000, day, False)
+
+        bot.replace_expense(1, expense_id, replacement, day)
+        row = bot.recent_expenses(1)[0]
+        self.assertEqual((row["category"], row["comment"], row["total"]), ("Транспорт", "такси", 70000))
+        deleted = bot.delete_expense(1, row["id"])
+        self.assertEqual(deleted["total"], 70000)
+        self.assertEqual(bot.recent_expenses(1), [])
+
+    def test_period_report_and_comparison(self):
+        bot.save_expenses(1, [("Еда", "", 12000)], date(2026, 9, 22))
+        bot.save_expenses(1, [("Транспорт", "", 8000)], date(2026, 9, 23))
+        report = bot.period_report_text(1, date(2026, 9, 22), date(2026, 9, 23))
+        self.assertIn("Всего: 200 ₽", report)
+        self.assertIn("Еда: 120 ₽", report)
+        self.assertIn("Сравнение недель", bot.comparison_text(1, date(2026, 9, 23)))
+
+    def test_category_limit_warning(self):
+        day = date(2026, 9, 24)
+        bot.set_category_limit(1, "еда", 100000)
+        bot.save_expenses(1, [("Еда", "", 85000)], day)
+        warning = bot.category_limit_warning(1, "ЕДА", day)
+        self.assertIn("85%", warning)
+
+    def test_recurring_payment_is_generated_once_per_month(self):
+        bot.ensure_user(1)
+        bot.add_recurring(1, 5, "Интернет", "домашний", 90000)
+        user = bot.get_user(1)
+        with patch.object(bot, "send") as send_mock:
+            bot.process_recurring(user, date(2026, 9, 26))
+            bot.process_recurring(user, date(2026, 9, 26))
+        self.assertEqual(bot.spent(1, date(2026, 9, 5), date(2026, 9, 5)), 90000)
+        self.assertEqual(send_mock.call_count, 1)
+
+    def test_favorites_search_and_export(self):
+        day = date(2026, 9, 24)
+        favorite_id = bot.add_favorite(1, "Еда", "Обед с Колей", 60000)
+        self.assertGreater(favorite_id, 0)
+        bot.save_expenses(1, [("Еда", "Обед с Колей", 60000)], day)
+        self.assertEqual(len(bot.search_expenses(1, "колей")), 1)
+        exported = bot.export_csv(1).decode("utf-8-sig")
+        self.assertIn("comment", exported)
+        self.assertIn("Обед с Колей", exported)
+
+    def test_history_edit_and_delete_callbacks_are_scoped(self):
+        old_user_ids = bot.ALLOWED_USER_IDS
+        bot.ALLOWED_USER_IDS = frozenset({1})
+        day = date(2026, 9, 24)
+        bot.save_expenses(1, [("Еда", "обед", 50000)], day)
+        expense_id = bot.recent_expenses(1)[0]["id"]
+        base = {
+            "id": "callback",
+            "from": {"id": 1},
+            "message": {"message_id": 10, "chat": {"id": 1}},
+        }
+        try:
+            with patch.object(bot, "api"), patch.object(bot, "send"):
+                bot.handle_callback({**base, "data": f"edit:{expense_id}"})
+            self.assertEqual(bot.get_pending_action(1)["expense_id"], expense_id)
+            bot.clear_pending_action(1)
+            with patch.object(bot, "api"), patch.object(bot, "send"):
+                bot.handle_callback({**base, "data": f"delete_confirm:{expense_id}"})
+            self.assertEqual(bot.recent_expenses(1), [])
+        finally:
+            bot.ALLOWED_USER_IDS = old_user_ids
+
+    def test_favorite_callback_adds_expense(self):
+        old_user_ids = bot.ALLOWED_USER_IDS
+        bot.ALLOWED_USER_IDS = frozenset({1})
+        bot.ensure_user(1)
+        favorite_id = bot.add_favorite(1, "Кофе", "капучино", 25000)
+        callback = {
+            "id": "callback",
+            "from": {"id": 1},
+            "data": f"favorite:{favorite_id}",
+            "message": {"message_id": 10, "chat": {"id": 1}},
+        }
+        try:
+            with patch.object(bot, "api"), patch.object(bot, "send"):
+                bot.handle_callback(callback)
+            today = bot.user_today(bot.get_user(1))
+            self.assertEqual(bot.spent(1, today, today), 25000)
+        finally:
+            bot.ALLOWED_USER_IDS = old_user_ids
+
     def test_done_button_acknowledges_and_deletes_reminder(self):
         old_user_ids = bot.ALLOWED_USER_IDS
         bot.ALLOWED_USER_IDS = frozenset({563057258, 656675199})
