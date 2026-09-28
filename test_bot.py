@@ -130,6 +130,8 @@ class StorageTest(unittest.TestCase):
         today = bot.user_today(bot.get_user(1))
         bot.save_expenses(1, [("Еда", "", 2500000)], today)
         self.assertIn("Прибыль за месяц (зарплата − траты на сегодня): 75 000 ₽", bot.report_text(bot.get_user(1)))
+        period = bot.period_report_text(1, today.replace(day=1), today)
+        self.assertIn("Прибыль за месяц (зарплата − траты): 75 000 ₽", period)
         self.assertNotIn("Зарплата за месяц", bot.report_text(bot.get_user(2)))
 
     def test_missing_budget_reminder_is_weekly(self):

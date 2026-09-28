@@ -659,6 +659,20 @@ def period_report_text(chat_id, start, end):
             lines.append(f"• {row['category']}: {money(row['total'])} ({share}%)")
     else:
         lines.append("• Нет трат")
+    user = get_user(chat_id)
+    if (
+        user
+        and user["salary_cents"]
+        and start == end.replace(day=1)
+        and (end == user_today(user) or end.day == calendar.monthrange(end.year, end.month)[1])
+    ):
+        lines.extend(
+            [
+                "",
+                f"Зарплата за месяц: {money(user['salary_cents'])}",
+                f"Прибыль за месяц (зарплата − траты): {money(user['salary_cents'] - total)}",
+            ]
+        )
     return "\n".join(lines)
 
 
