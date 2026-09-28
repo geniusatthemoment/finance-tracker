@@ -62,6 +62,25 @@ class ExpenseParserTest(unittest.TestCase):
             [("Еда", "", 50000, today, False)],
         )
 
+    def test_expense_day_changes_at_four_am(self):
+        tz = ZoneInfo("Asia/Tomsk")
+        self.assertEqual(
+            bot.business_day(datetime(2026, 10, 1, 3, 59, tzinfo=tz)),
+            date(2026, 9, 30),
+        )
+        self.assertEqual(
+            bot.business_day(datetime(2026, 10, 1, 4, 0, tzinfo=tz)),
+            date(2026, 10, 1),
+        )
+
+    def test_explicit_calendar_date_is_allowed_after_midnight(self):
+        self.assertEqual(
+            bot.parse_expense_message(
+                "01.10.2026 еда 500", date(2026, 9, 30), date(2026, 10, 1)
+            ),
+            [("Еда", "", 50000, date(2026, 10, 1), False)],
+        )
+
     def test_date_prefix_applies_to_every_expense(self):
         today = date(2026, 9, 24)
         expected = date(2026, 9, 23)
@@ -122,6 +141,26 @@ class StorageTest(unittest.TestCase):
         day = date(2026, 9, 24)
         bot.save_expenses(1, [("еда", "обед", 50000), ("транспорт", "", 25000)], day)
         self.assertEqual(bot.spent(1, day, day), 75000)
+
+    def test_night_expense_is_saved_on_previous_day(self):
+        bot.ensure_user(1)
+        old_user_ids = bot.ALLOWED_USER_IDS
+        bot.ALLOWED_USER_IDS = frozenset({1})
+
+        class FrozenDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return datetime(2026, 10, 1, 2, 30, tzinfo=ZoneInfo("Asia/Tomsk")).astimezone(tz)
+
+        try:
+            with patch.object(bot, "datetime", FrozenDateTime), patch.object(bot, "send"):
+                bot.handle_message(
+                    {"from": {"id": 1}, "chat": {"id": 1}, "text": "Еда ночной перекус 500"}
+                )
+        finally:
+            bot.ALLOWED_USER_IDS = old_user_ids
+        self.assertEqual(bot.spent(1, date(2026, 9, 30), date(2026, 9, 30)), 50000)
+        self.assertEqual(bot.spent(1, date(2026, 10, 1), date(2026, 10, 1)), 0)
 
     def test_salary_is_per_user_and_report_shows_monthly_profit(self):
         for chat_id in (1, 2):
@@ -366,6 +405,35 @@ class StorageTest(unittest.TestCase):
             ],
         )
         self.assertIn("Вчера без трат", str(send_mock.call_args.args[2]))
+
+    def test_ten_am_profit_uses_previous_month_day_count(self):
+        bot.ensure_user(1)
+        with bot.db() as connection:
+            connection.execute("UPDATE users SET salary_cents = ? WHERE chat_id = 1", (3100000,))
+        bot.save_expenses(1, [("Еда", "", 120000)], date(2026, 9, 30))
+
+        class FrozenDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return datetime(2026, 10, 1, 10, 0, tzinfo=ZoneInfo("Asia/Tomsk")).astimezone(tz)
+
+        with patch.object(bot, "datetime", FrozenDateTime), patch.object(
+            bot, "send", return_value={"message_id": 1}
+        ) as send_mock:
+            bot.run_schedule()
+            bot.run_schedule()
+        self.assertEqual(send_mock.call_count, 1)
+        message = send_mock.call_args.args[1]
+        self.assertIn("Итог за 30.09.2026", message)
+        self.assertIn("Зарплата за день: 1 033.33 ₽", message)
+        self.assertIn("Траты: 1 200 ₽", message)
+        self.assertIn("Прибыль за день: -166.67 ₽", message)
+
+    def test_ten_am_profit_skips_user_without_salary(self):
+        bot.ensure_user(1)
+        with patch.object(bot, "send") as send_mock:
+            bot.send_daily_profit(bot.get_user(1), date(2026, 9, 30))
+        send_mock.assert_not_called()
 
     def test_failed_reminder_is_retried(self):
         day = date(2026, 9, 28)

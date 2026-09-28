@@ -15,7 +15,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from datetime import date, datetime, timedelta
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
 
 
@@ -252,8 +252,14 @@ def normalize_category(category):
     return " ".join(category.split()).casefold().capitalize()
 
 
+def business_day(local_now):
+    """The expense day changes at 04:00 in the user's local timezone."""
+    day = local_now.date()
+    return day - timedelta(days=1) if local_now.hour < 4 else day
+
+
 def user_today(user):
-    return datetime.now(ZoneInfo(user["timezone"])).date()
+    return business_day(datetime.now(ZoneInfo(user["timezone"])))
 
 
 def get_user(chat_id):
@@ -291,27 +297,28 @@ def parse_expenses(text):
     return parsed
 
 
-def parse_date(value, today):
+def parse_date(value, today, latest_date=None):
+    latest_date = latest_date or today
     pieces = value.split(".")
     day, month = int(pieces[0]), int(pieces[1])
-    year = today.year if len(pieces) == 2 else int(pieces[2])
+    year = latest_date.year if len(pieces) == 2 else int(pieces[2])
     if year < 100:
         year += 2000
     try:
         result = date(year, month, day)
     except ValueError:
         raise ValueError(f"Некорректная дата: «{value}»")
-    if result > today:
+    if result > latest_date:
         raise ValueError("Нельзя записать трату на будущую дату")
     return result
 
 
-def parse_expense_message(text, today):
+def parse_expense_message(text, today, latest_date=None):
     """Parse expenses with an optional global prefix or per-item date suffix."""
     global_date = None
     prefix = DATE_PREFIX_RE.match(text.strip())
     if prefix:
-        global_date = parse_date(prefix.group(1), today)
+        global_date = parse_date(prefix.group(1), today, latest_date)
         text = prefix.group(2)
 
     result = []
@@ -327,7 +334,7 @@ def parse_expense_message(text, today):
             suffix = DATE_SUFFIX_RE.match(part)
             if suffix:
                 part = suffix.group(1).strip()
-                spent_on = parse_date(suffix.group(2), today)
+                spent_on = parse_date(suffix.group(2), today, latest_date)
         parsed = parse_expenses(part)
         category, comment, cents = parsed[0]
         result.append((category, comment, cents, spent_on, monthly))
@@ -1289,10 +1296,11 @@ def handle_message(message):
         return
 
     today = user_today(user)
+    calendar_today = datetime.now(ZoneInfo(user["timezone"])).date()
     pending = get_pending_action(chat_id)
     if pending and pending["action"] == "edit":
         try:
-            items = parse_expense_message(text, today)
+            items = parse_expense_message(text, today, calendar_today)
         except ValueError as error:
             send(chat_id, f"{error}. Отправь исправленную покупку или /cancel.")
             return
@@ -1313,7 +1321,7 @@ def handle_message(message):
         )
         return
     try:
-        items = parse_expense_message(text, today)
+        items = parse_expense_message(text, today, calendar_today)
     except ValueError as error:
         send(
             chat_id,
@@ -1623,16 +1631,39 @@ def send_morning_update(user, today):
             mark_sent(chat_id, today, "budget_weekly")
 
 
+def send_daily_profit(user, day):
+    if not user["salary_cents"] or was_sent(user["chat_id"], day, "daily_profit"):
+        return
+    days_in_month = calendar.monthrange(day.year, day.month)[1]
+    daily_salary_cents = int(
+        (Decimal(user["salary_cents"]) / days_in_month).quantize(
+            Decimal("1"), rounding=ROUND_HALF_UP
+        )
+    )
+    expenses_cents = spent(user["chat_id"], day, day)
+    message = (
+        f"Итог за {day:%d.%m.%Y}:\n"
+        f"Зарплата за день: {money(daily_salary_cents)}\n"
+        f"Траты: {money(expenses_cents)}\n"
+        f"Прибыль за день: {money(daily_salary_cents - expenses_cents)}"
+    )
+    if send(user["chat_id"], message) is not None:
+        mark_sent(user["chat_id"], day, "daily_profit")
+
+
 def run_schedule():
     with db() as connection:
         users = connection.execute("SELECT * FROM users").fetchall()
     for user in users:
         local_now = datetime.now(ZoneInfo(user["timezone"]))
         today = local_now.date()
+        expense_today = business_day(local_now)
         hour, minute = local_now.hour, local_now.minute
-        process_recurring(user, today)
+        process_recurring(user, expense_today)
         if hour == MORNING_HOUR and minute < 5:
             send_morning_update(user, today)
+        if hour == 10 and minute < 5:
+            send_daily_profit(user, today - timedelta(days=1))
         if hour == 20 and minute < 5:
             reminder(
                 user["chat_id"], today, "reminder20",
