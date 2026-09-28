@@ -136,6 +136,156 @@ class StorageTest(unittest.TestCase):
         bot.DB_PATH = self.old_path
         os.unlink(self.path)
 
+    def send_command(self, chat_id, text):
+        old_ids = bot.ALLOWED_USER_IDS
+        bot.ALLOWED_USER_IDS = frozenset({chat_id})
+        try:
+            with patch.object(bot, "send") as send_mock:
+                bot.handle_message({"from": {"id": chat_id}, "chat": {"id": chat_id}, "text": text})
+            return send_mock.call_args.args[1]
+        finally:
+            bot.ALLOWED_USER_IDS = old_ids
+
+    def test_extra_income_and_refund_adjust_balance_without_deleting_purchase(self):
+        bot.ensure_user(1)
+        today = bot.user_today(bot.get_user(1))
+        bot.save_expenses(1, [("Еда", "покупка", 100000)], today)
+        self.assertIn("Записал доход", self.send_command(1, "/income подработка 500"))
+        self.assertIn("Записал возврат", self.send_command(1, "/refund Еда 300"))
+        self.assertEqual(bot.spent(1, today, today), 70000)
+        self.assertEqual(bot.income_total(1, today, today), 50000)
+        self.assertEqual(len(bot.recent_expenses(1)), 2)
+
+    def test_refund_can_reference_purchase_and_cannot_exceed_it(self):
+        bot.ensure_user(1)
+        today = bot.user_today(bot.get_user(1))
+        bot.save_expenses(1, [("Еда", "обед", 100000)], today)
+        purchase_id = bot.recent_expenses(1)[0]["id"]
+        self.assertIn("Записал возврат", self.send_command(1, f"/refund {purchase_id} 800"))
+        self.assertIn("больше суммы", self.send_command(1, f"/refund {purchase_id} 300"))
+        self.assertEqual(bot.spent(1, today, today), 20000)
+
+    def test_goal_and_plan_reduce_free_balance_but_not_actual_spending(self):
+        bot.ensure_user(1)
+        self.send_command(1, "/salary 30000")
+        today = bot.user_today(bot.get_user(1))
+        plan_day = today.replace(day=bot.calendar.monthrange(today.year, today.month)[1])
+        self.send_command(1, "/goal 5000")
+        self.send_command(1, f"/plan {plan_day:%d.%m.%Y} ремонт 3000")
+        self.assertEqual(bot.spent(1, today.replace(day=1), today), 0)
+        self.assertIn("22 000 ₽", self.send_command(1, "/free"))
+        self.assertIn("ремонт", self.send_command(1, "/plans"))
+
+    def test_salary_history_keeps_old_daily_rate(self):
+        bot.ensure_user(1)
+        with bot.db() as connection:
+            connection.execute("INSERT INTO salary_history VALUES (1, '2026-09-01', 3000000)")
+            connection.execute("INSERT INTO salary_history VALUES (1, '2026-10-01', 6200000)")
+            connection.execute("UPDATE users SET salary_cents = 6200000 WHERE chat_id = 1")
+        self.assertEqual(bot.salary_for_day(1, date(2026, 9, 30)), 3000000)
+        self.assertEqual(bot.salary_for_day(1, date(2026, 10, 1)), 6200000)
+        self.assertEqual(bot.salary_month_total(1, date(2026, 9, 30)), 3000000)
+        with patch.object(bot, "send", return_value={"message_id": 1}) as send_mock:
+            bot.send_daily_profit(bot.get_user(1), date(2026, 9, 30))
+        self.assertIn("Зарплата за день: 1 000 ₽", send_mock.call_args.args[1])
+
+    def test_csv_import_is_atomic_and_idempotent_per_user(self):
+        bot.ensure_user(1)
+        bot.ensure_user(2)
+        csv_content = b"date,category,comment,amount_rub\n2026-09-01,food,lunch,50.00\n"
+        self.assertEqual(bot.import_csv_bytes(1, csv_content), 1)
+        self.assertEqual(bot.import_csv_bytes(1, csv_content), 0)
+        self.assertEqual(bot.import_csv_bytes(2, csv_content), 1)
+        bad = b"date,category,comment,amount_rub\n2026-09-01,food,lunch,50.00\nbad,food,lunch,20.00\n"
+        with self.assertRaises(ValueError):
+            bot.import_csv_bytes(1, bad)
+        self.assertEqual(bot.spent(1, date(2026, 9, 1), date(2026, 9, 1)), 5000)
+
+    def test_month_comparison_and_weekly_digest(self):
+        bot.ensure_user(1)
+        bot.save_expenses(1, [("Еда", "", 10000)], date(2026, 9, 20))
+        bot.save_expenses(1, [("Еда", "", 20000)], date(2026, 9, 27))
+        self.assertIn("Еда", bot.weekly_digest_text(1, date(2026, 9, 28)))
+        self.assertIn("Сравнение месяцев", bot.month_comparison_text(1, date(2026, 9, 28)))
+
+    def test_anomaly_uses_prior_four_weeks(self):
+        bot.ensure_user(1)
+        bot.save_expenses(1, [("Такси", "", 400000)], date(2026, 9, 7))
+        bot.save_expenses(1, [("Такси", "", 250000)], date(2026, 9, 28))
+        self.assertIn("больше чем вдвое", bot.anomaly_text(1, "Такси", date(2026, 9, 28)))
+
+    def test_settings_are_per_user_and_custom_cutoff_works(self):
+        bot.ensure_user(1)
+        bot.ensure_user(2)
+        self.send_command(1, "/settings cutoff 6")
+        self.send_command(1, "/settings reminders 19 21 1")
+        self.assertEqual(bot.get_user(1)["day_cutoff_hour"], 6)
+        self.assertEqual(bot.get_user(2)["day_cutoff_hour"], 4)
+        self.assertEqual(bot.get_user(1)["reminder_hours"], "19,21,1")
+        self.assertEqual(bot.business_day(datetime(2026, 10, 1, 5), 6), date(2026, 9, 30))
+
+    def test_import_document_uses_telegram_caption(self):
+        old_ids = bot.ALLOWED_USER_IDS
+        bot.ALLOWED_USER_IDS = frozenset({1})
+        try:
+            with patch.object(bot, "handle_import_document") as importer:
+                bot.handle_message({
+                    "from": {"id": 1}, "chat": {"id": 1}, "caption": "/import",
+                    "document": {"file_id": "file", "file_name": "expenses.csv"},
+                })
+            importer.assert_called_once()
+        finally:
+            bot.ALLOWED_USER_IDS = old_ids
+
+    def test_export_import_roundtrip_includes_monthly_and_refund(self):
+        bot.ensure_user(1)
+        bot.ensure_user(2)
+        day = date(2026, 9, 24)
+        bot.save_monthly_expense(1, "Зал", "", 250000, day)
+        bot.save_expenses(1, [("Зал", "Возврат", -50000)], day)
+        content = bot.export_csv(1)
+        self.assertEqual(bot.import_csv_bytes(2, content), 31)
+        self.assertEqual(bot.spent(1, date(2026, 9, 1), date(2026, 9, 30)), 200000)
+        self.assertEqual(bot.spent(2, date(2026, 9, 1), date(2026, 9, 30)), 200000)
+
+    def test_salary_command_keeps_earlier_dates(self):
+        bot.ensure_user(1)
+        with bot.db() as connection:
+            connection.execute("INSERT INTO salary_history VALUES (1, '2026-09-01', 3000000)")
+            connection.execute("UPDATE users SET salary_cents = 3000000 WHERE chat_id = 1")
+        self.send_command(1, "/salary 60000")
+        self.assertEqual(bot.salary_for_day(1, date(2026, 9, 1)), 3000000)
+        self.assertEqual(bot.salary_for_day(1, bot.user_today(bot.get_user(1))), 6000000)
+
+    def test_upgrade_preserves_existing_salary_and_expenses(self):
+        bot.ensure_user(1)
+        day = date(2026, 9, 12)
+        bot.save_expenses(1, [("Еда", "обед", 50000)], day)
+        with bot.db() as connection:
+            connection.execute("UPDATE users SET salary_cents = 4000000 WHERE chat_id = 1")
+        bot.init_db()
+        self.assertEqual(bot.salary_for_day(1, day), 4000000)
+        self.assertEqual(bot.spent(1, day, day), 50000)
+        self.assertEqual(bot.get_user(1)["day_cutoff_hour"], 4)
+
+    def test_custom_reminder_hour_runs_once(self):
+        bot.ensure_user(1)
+        with bot.db() as connection:
+            connection.execute("UPDATE users SET reminder_hours = '19,21,1' WHERE chat_id = 1")
+
+        class FrozenDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return datetime(2026, 9, 28, 19, tzinfo=ZoneInfo("Asia/Tomsk")).astimezone(tz)
+
+        with patch.object(bot, "datetime", FrozenDateTime), patch.object(
+            bot, "send", return_value={"message_id": 1}
+        ) as sender:
+            bot.run_schedule()
+            bot.run_schedule()
+        self.assertEqual(sender.call_count, 1)
+        self.assertIn("Запиши сегодняшние траты", sender.call_args.args[1])
+
     def test_save_and_total(self):
         bot.ensure_user(1)
         day = date(2026, 9, 24)

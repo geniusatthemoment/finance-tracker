@@ -3,6 +3,7 @@
 
 import calendar
 import csv
+import hashlib
 import io
 import json
 import os
@@ -133,6 +134,35 @@ def init_db():
                 action TEXT NOT NULL,
                 expense_id INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS income (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                description TEXT NOT NULL,
+                amount_cents INTEGER NOT NULL,
+                received_on TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS salary_history (
+                chat_id INTEGER NOT NULL,
+                effective_from TEXT NOT NULL,
+                salary_cents INTEGER NOT NULL,
+                PRIMARY KEY (chat_id, effective_from)
+            );
+
+            CREATE TABLE IF NOT EXISTS planned_expenses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                description TEXT NOT NULL,
+                amount_cents INTEGER NOT NULL,
+                planned_on TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS imported_files (
+                chat_id INTEGER NOT NULL,
+                sha256 TEXT NOT NULL,
+                PRIMARY KEY (chat_id, sha256)
+            );
             """
         )
         user_columns = {
@@ -142,6 +172,21 @@ def init_db():
             connection.execute(
                 "ALTER TABLE users ADD COLUMN salary_cents INTEGER NOT NULL DEFAULT 0"
             )
+        for name, declaration in (
+            ("savings_goal_cents", "INTEGER NOT NULL DEFAULT 0"),
+            ("day_cutoff_hour", "INTEGER NOT NULL DEFAULT 4"),
+            ("reminder_hours", "TEXT NOT NULL DEFAULT '20,22,0'"),
+            ("morning_hour", f"INTEGER NOT NULL DEFAULT {MORNING_HOUR}"),
+            ("profit_hour", "INTEGER NOT NULL DEFAULT 10"),
+        ):
+            if name not in user_columns:
+                connection.execute(f"ALTER TABLE users ADD COLUMN {name} {declaration}")
+        connection.execute(
+            """INSERT OR IGNORE INTO salary_history(chat_id, effective_from, salary_cents)
+               SELECT chat_id, '0001-01-01', salary_cents FROM users
+               WHERE salary_cents > 0 AND NOT EXISTS
+               (SELECT 1 FROM salary_history WHERE salary_history.chat_id = users.chat_id)"""
+        )
         columns = {
             row["name"] for row in connection.execute("PRAGMA table_info(expenses)").fetchall()
         }
@@ -235,6 +280,92 @@ def money(cents):
     return rendered + " ₽"
 
 
+def parse_money(value, allow_zero=False):
+    if not re.fullmatch(r"\d+(?:\.\d{1,2})?", value):
+        raise ValueError("Сумма должна быть числом, копейки — через точку.")
+    cents = int(Decimal(value) * 100)
+    if cents < 0 or (cents == 0 and not allow_zero):
+        raise ValueError("Сумма должна быть больше нуля.")
+    return cents
+
+
+def salary_for_day(chat_id, day):
+    with db() as connection:
+        row = connection.execute(
+            """SELECT salary_cents FROM salary_history
+               WHERE chat_id = ? AND effective_from <= ?
+               ORDER BY effective_from DESC LIMIT 1""",
+            (chat_id, day.isoformat()),
+        ).fetchone()
+        if row:
+            return row["salary_cents"]
+        has_history = connection.execute(
+            "SELECT 1 FROM salary_history WHERE chat_id = ? LIMIT 1", (chat_id,)
+        ).fetchone()
+        if has_history:
+            return 0
+        user = connection.execute(
+            "SELECT salary_cents FROM users WHERE chat_id = ?", (chat_id,)
+        ).fetchone()
+    return user["salary_cents"] if user else 0
+
+
+def salary_share(chat_id, start, end):
+    total = 0
+    day = start
+    while day <= end:
+        monthly = salary_for_day(chat_id, day)
+        days = calendar.monthrange(day.year, day.month)[1]
+        total += int((Decimal(monthly) / days).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+        day += timedelta(days=1)
+    return total
+
+
+def salary_month_total(chat_id, month_day):
+    days = calendar.monthrange(month_day.year, month_day.month)[1]
+    value = sum(
+        (Decimal(salary_for_day(chat_id, date(month_day.year, month_day.month, number))) / days
+         for number in range(1, days + 1)),
+        Decimal(0),
+    )
+    return int(value.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def income_total(chat_id, start, end):
+    with db() as connection:
+        row = connection.execute(
+            """SELECT COALESCE(SUM(amount_cents), 0) AS total FROM income
+               WHERE chat_id = ? AND received_on BETWEEN ? AND ?""",
+            (chat_id, start.isoformat(), end.isoformat()),
+        ).fetchone()
+    return row["total"]
+
+
+def incomes_text(chat_id):
+    with db() as connection:
+        rows = connection.execute(
+            "SELECT * FROM income WHERE chat_id = ? ORDER BY received_on DESC, id DESC LIMIT 20",
+            (chat_id,),
+        ).fetchall()
+    if not rows:
+        return "Других доходов пока нет. Добавь: /income подработка 5000"
+    lines = ["Последние доходы:"]
+    lines.extend(
+        f"• #{row['id']} · {date.fromisoformat(row['received_on']):%d.%m.%Y} · {row['description']} — {money(row['amount_cents'])}"
+        for row in rows
+    )
+    lines.append("Удалить ошибочную запись: /income_delete ID")
+    return "\n".join(lines)
+
+
+def monthly_balance(chat_id, today):
+    start = today.replace(day=1)
+    salary = salary_month_total(chat_id, today)
+    income = income_total(chat_id, start, today)
+    expenses = spent(chat_id, start, today)
+    return salary + income - expenses
+
+
 def ensure_user(chat_id):
     with db() as connection:
         connection.execute(
@@ -252,14 +383,14 @@ def normalize_category(category):
     return " ".join(category.split()).casefold().capitalize()
 
 
-def business_day(local_now):
+def business_day(local_now, cutoff_hour=4):
     """The expense day changes at 04:00 in the user's local timezone."""
     day = local_now.date()
-    return day - timedelta(days=1) if local_now.hour < 4 else day
+    return day - timedelta(days=1) if local_now.hour < cutoff_hour else day
 
 
 def user_today(user):
-    return business_day(datetime.now(ZoneInfo(user["timezone"])))
+    return business_day(datetime.now(ZoneInfo(user["timezone"])), user["day_cutoff_hour"])
 
 
 def get_user(chat_id):
@@ -667,19 +798,24 @@ def period_report_text(chat_id, start, end):
     else:
         lines.append("• Нет трат")
     user = get_user(chat_id)
+    other_income = income_total(chat_id, start, end)
     if (
         user
-        and user["salary_cents"]
+        and salary_month_total(chat_id, end)
         and start == end.replace(day=1)
         and (end == user_today(user) or end.day == calendar.monthrange(end.year, end.month)[1])
     ):
         lines.extend(
             [
                 "",
-                f"Зарплата за месяц: {money(user['salary_cents'])}",
-                f"Прибыль за месяц (зарплата − траты): {money(user['salary_cents'] - total)}",
+                f"Зарплата за месяц: {money(salary_month_total(chat_id, end))}",
+                f"Прибыль за месяц (зарплата − траты): {money(salary_month_total(chat_id, end) + other_income - total)}",
             ]
         )
+    if other_income:
+        lines.append(f"Другие доходы: {money(other_income)}")
+        if not salary_month_total(chat_id, end):
+            lines.append(f"Прибыль (другие доходы − траты): {money(other_income - total)}")
     return "\n".join(lines)
 
 
@@ -733,6 +869,103 @@ def comparison_text(chat_id, today):
         lines.extend(["", "Больше всего выросли:"])
         lines.extend(f"• {category}: +{money(value)}" for category, value in increases)
     return "\n".join(lines)
+
+
+def month_comparison_text(chat_id, today):
+    current_start = today.replace(day=1)
+    previous_end = current_start - timedelta(days=1)
+    previous_start = previous_end.replace(day=1)
+    current = spent(chat_id, current_start, today)
+    previous = spent(chat_id, previous_start, previous_end)
+    current_categories = {row["category"]: row["total"] for row in category_totals(chat_id, current_start, today, 100)}
+    previous_categories = {row["category"]: row["total"] for row in category_totals(chat_id, previous_start, previous_end, 100)}
+    changes = sorted(
+        ((name, amount - previous_categories.get(name, 0)) for name, amount in current_categories.items()),
+        key=lambda item: item[1], reverse=True,
+    )
+    lines = [
+        "Сравнение месяцев (текущий — на сегодня, прошлый — целиком)",
+        f"Этот месяц: {money(current)}",
+        f"Прошлый: {money(previous)}",
+        f"Разница: {money(current - previous)}",
+    ]
+    rises = [(name, change) for name, change in changes if change > 0][:3]
+    if rises:
+        lines.extend(["", "Больше всего выросли:"])
+        lines.extend(f"• {name}: +{money(change)}" for name, change in rises)
+    return "\n".join(lines)
+
+
+def weekly_digest_text(chat_id, monday):
+    end = monday - timedelta(days=1)
+    start = end - timedelta(days=6)
+    before_end = start - timedelta(days=1)
+    before_start = before_end - timedelta(days=6)
+    total = spent(chat_id, start, end)
+    previous = spent(chat_id, before_start, before_end)
+    earnings = salary_share(chat_id, start, end) + income_total(chat_id, start, end)
+    top = category_totals(chat_id, start, end, 3)
+    lines = [
+        f"Итог недели {start:%d.%m}–{end:%d.%m}",
+        f"Траты: {money(total)}",
+        f"Прибыль (доходы − траты): {money(earnings - total)}",
+        f"К прошлой неделе: {money(total - previous)}",
+        "Топ категорий: " + (", ".join(f"{row['category']} {money(row['total'])}" for row in top) if top else "нет трат"),
+    ]
+    return "\n".join(lines)
+
+
+def anomaly_text(chat_id, category, today):
+    week_start = today - timedelta(days=today.weekday())
+    prior_end = week_start - timedelta(days=1)
+    prior_start = prior_end - timedelta(days=27)
+    with db() as connection:
+        previous = connection.execute(
+            """SELECT COALESCE(SUM(amount_cents), 0) AS total FROM expenses
+               WHERE chat_id = ? AND category = ? AND spent_on BETWEEN ? AND ?""",
+            (chat_id, category, prior_start.isoformat(), prior_end.isoformat()),
+        ).fetchone()["total"]
+        current = connection.execute(
+            """SELECT COALESCE(SUM(amount_cents), 0) AS total FROM expenses
+               WHERE chat_id = ? AND category = ? AND spent_on BETWEEN ? AND ?""",
+            (chat_id, category, week_start.isoformat(), today.isoformat()),
+        ).fetchone()["total"]
+    typical_week = previous // 4
+    if typical_week >= 100000 and current > typical_week * 2:
+        return f"⚠️ На «{category}» за эту неделю ушло {money(current)} — больше чем вдвое выше обычного ({money(typical_week)} в неделю)."
+    return None
+
+
+def plans_text(chat_id, today):
+    with db() as connection:
+        rows = connection.execute(
+            "SELECT * FROM planned_expenses WHERE chat_id = ? AND planned_on >= ? ORDER BY planned_on, id",
+            (chat_id, today.isoformat()),
+        ).fetchall()
+    if not rows:
+        return "Планируемых трат нет. Добавь: /plan 15.10 стоматолог 15000"
+    lines = ["Планируемые траты:"]
+    for row in rows:
+        lines.append(f"• #{row['id']} · {date.fromisoformat(row['planned_on']):%d.%m} · {row['description']} — {money(row['amount_cents'])}")
+    lines.append("Удалить: /plan_delete ID")
+    return "\n".join(lines)
+
+
+def free_to_spend_text(user, today):
+    start = today.replace(day=1)
+    end = today.replace(day=calendar.monthrange(today.year, today.month)[1])
+    with db() as connection:
+        planned = connection.execute(
+            """SELECT COALESCE(SUM(amount_cents), 0) AS total FROM planned_expenses
+               WHERE chat_id = ? AND planned_on BETWEEN ? AND ?""",
+            (user["chat_id"], today.isoformat(), end.isoformat()),
+        ).fetchone()["total"]
+    available = monthly_balance(user["chat_id"], today) - user["savings_goal_cents"] - planned
+    return (
+        f"Свободно до конца месяца: {money(available)}\n"
+        f"Цель накоплений: {money(user['savings_goal_cents'])}\n"
+        f"Будущие запланированные траты: {money(planned)}"
+    )
 
 
 def set_category_limit(chat_id, category, limit_cents):
@@ -977,6 +1210,81 @@ def export_csv(chat_id):
     return b"\xef\xbb\xbf" + output.getvalue().encode("utf-8")
 
 
+def import_csv_bytes(chat_id, content):
+    if len(content) > 2_000_000:
+        raise ValueError("CSV слишком большой (максимум 2 МБ).")
+    digest = hashlib.sha256(content).hexdigest()
+    with db() as connection:
+        if connection.execute(
+            "SELECT 1 FROM imported_files WHERE chat_id = ? AND sha256 = ?", (chat_id, digest)
+        ).fetchone():
+            return 0
+    try:
+        reader = csv.DictReader(io.StringIO(content.decode("utf-8-sig")))
+        required = {"date", "category", "comment", "amount_rub"}
+        if not reader.fieldnames or not required.issubset(reader.fieldnames):
+            raise ValueError("Нужен CSV из /export с колонками date, category, comment, amount_rub.")
+        rows = []
+        now = datetime.utcnow().isoformat()
+        for record in reader:
+            if len(rows) >= 20000:
+                raise ValueError("В CSV слишком много строк (максимум 20 000).")
+            try:
+                spent_on = date.fromisoformat(record["date"])
+                category = normalize_category(record["category"])
+                comment = (record["comment"] or "").strip()
+                amount = Decimal(record["amount_rub"])
+                if not amount.is_finite() or amount.as_tuple().exponent < -2:
+                    raise ValueError
+                cents = int(amount * 100)
+            except (ValueError, TypeError, InvalidOperation, OverflowError) as error:
+                raise ValueError(f"Ошибка в строке {len(rows) + 2} CSV.") from error
+            if not category or len(category) > 60 or len(comment) > 300 or cents == 0:
+                raise ValueError(f"Ошибка в строке {len(rows) + 2} CSV.")
+            imported_batch = record.get("monthly_batch")
+            if imported_batch:
+                imported_batch = f"import:{digest[:12]}:{imported_batch}"
+            rows.append((chat_id, category, comment, cents, spent_on.isoformat(), now, imported_batch))
+    except UnicodeDecodeError as error:
+        raise ValueError("CSV должен быть в UTF-8.") from error
+    with db() as connection:
+        connection.executemany(
+            """INSERT INTO expenses(chat_id, category, comment, amount_cents, spent_on, created_at, batch_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""", rows,
+        )
+        connection.execute(
+            "INSERT INTO imported_files(chat_id, sha256) VALUES (?, ?)", (chat_id, digest)
+        )
+    return len(rows)
+
+
+def handle_import_document(chat_id, document):
+    if document.get("file_size", 0) > 2_000_000:
+        send(chat_id, "CSV слишком большой (максимум 2 МБ).")
+        return
+    if not document.get("file_name", "").lower().endswith(".csv"):
+        send(chat_id, "Пришли CSV-файл из /export.")
+        return
+    file_info = api("getFile", file_id=document["file_id"])
+    if not file_info or not file_info.get("file_path"):
+        send(chat_id, "Не удалось скачать файл. Попробуй ещё раз.")
+        return
+    path = urllib.parse.quote(file_info["file_path"], safe="/")
+    url = f"https://api.telegram.org/file/bot{TOKEN}/{path}"
+    try:
+        with urllib.request.urlopen(url, timeout=35) as response:
+            content = response.read(2_000_001)
+        count = import_csv_bytes(chat_id, content)
+    except (urllib.error.URLError, TimeoutError) as error:
+        print("Telegram file download failed:", error, file=sys.stderr)
+        send(chat_id, "Не удалось скачать файл. Попробуй ещё раз.")
+        return
+    except ValueError as error:
+        send(chat_id, str(error))
+        return
+    send(chat_id, f"Импортировал {count} записей." if count else "Этот CSV уже импортирован — повторно не добавляю.")
+
+
 def budget_snapshot(user, today):
     month_start = today.replace(day=1)
     days_in_month = calendar.monthrange(today.year, today.month)[1]
@@ -1025,11 +1333,16 @@ def report_text(user):
             (user["chat_id"], today.isoformat()),
         ).fetchone()["total"]
     salary_lines = []
-    if user["salary_cents"]:
+    if salary_month_total(user["chat_id"], today):
         salary_lines = [
-            f"Зарплата за месяц: {money(user['salary_cents'])}",
-            f"Прибыль за месяц (зарплата − траты на сегодня): {money(user['salary_cents'] - current_total)}",
+            f"Зарплата за месяц: {money(salary_month_total(user['chat_id'], today))}",
+            f"Прибыль за месяц (зарплата − траты на сегодня): {money(monthly_balance(user['chat_id'], today))}",
         ]
+    extra_income = income_total(user["chat_id"], month_start, today)
+    if extra_income:
+        salary_lines.append(f"Другие доходы за месяц: {money(extra_income)}")
+        if not salary_month_total(user["chat_id"], today):
+            salary_lines.append(f"Прибыль (другие доходы − траты): {money(extra_income - current_total)}")
     if not first:
         return "\n".join(
             ["Пока нет ни одной траты. Напиши, например: еда 500, транспорт 250"]
@@ -1084,6 +1397,10 @@ def help_text():
         "Команды:\n"
         "/budget 70000 — бюджет на месяц\n"
         "/salary 100000 — зарплата за месяц (0 — убрать)\n"
+        "/income подработка 5000 — другой доход; /incomes — список\n"
+        "/refund 123 800 — возврат покупки #123 (номер в /history)\n"
+        "/goal 20000 — цель накоплений; /free — свободные деньги\n"
+        "/plan 15.10 стоматолог 15000 — будущая трата; /plans — список\n"
         "/report — отчет и выбор периода\n"
         "/report 01.09 15.09 — отчет за период\n"
         "/history — последние покупки и комментарии\n"
@@ -1093,7 +1410,10 @@ def help_text():
         "/favorites — быстрые траты\n"
         "/search текст — поиск по комментариям\n"
         "/compare — сравнить недели\n"
+        "/compare_months — сравнить месяцы; /week — прошлая неделя\n"
         "/export — выгрузить CSV\n"
+        "/import — загрузить CSV из экспорта\n"
+        "/settings — время и часовой пояс\n"
         "/undo — удалить последнюю запись\n"
         "/zero — сегодня без трат\n"
         "/help — эта подсказка"
@@ -1116,9 +1436,16 @@ def handle_message(message):
     if not is_allowed(message):
         return
     chat_id = message["chat"]["id"]
-    text = message.get("text", "").strip()
+    text = (message.get("text") or message.get("caption") or "").strip()
     ensure_user(chat_id)
     user = get_user(chat_id)
+
+    if message.get("document"):
+        if text == "/import":
+            handle_import_document(chat_id, message["document"])
+        else:
+            send(chat_id, "Чтобы импортировать CSV, пришли файл с подписью /import.")
+        return
 
     if text in ("/start", "/help"):
         send(chat_id, "Готово. Я буду записывать твои траты.\n\n" + help_text())
@@ -1140,13 +1467,188 @@ def handle_message(message):
             return
         cents = int(Decimal(pieces[1]) * 100)
         with db() as connection:
+            already_had_salary = connection.execute(
+                "SELECT 1 FROM salary_history WHERE chat_id = ? LIMIT 1", (chat_id,)
+            ).fetchone()
+            effective_day = user_today(user)
+            if not already_had_salary and cents:
+                effective_day = effective_day.replace(day=1)
             connection.execute(
                 "UPDATE users SET salary_cents = ? WHERE chat_id = ?", (cents, chat_id)
+            )
+            connection.execute(
+                """INSERT INTO salary_history(chat_id, effective_from, salary_cents)
+                   VALUES (?, ?, ?) ON CONFLICT(chat_id, effective_from)
+                   DO UPDATE SET salary_cents = excluded.salary_cents""",
+                (chat_id, effective_day.isoformat(), cents),
             )
         send(
             chat_id,
             f"Зарплата за месяц сохранена: {money(cents)}" if cents else "Зарплата удалена.",
         )
+        return
+    if text.startswith("/income "):
+        body = text[len("/income "):].strip()
+        given_date = DATE_PREFIX_RE.match(body)
+        received_on = user_today(user)
+        if given_date:
+            try:
+                received_on = parse_date(given_date.group(1), received_on, datetime.now(ZoneInfo(user["timezone"])).date())
+            except ValueError as error:
+                send(chat_id, str(error))
+                return
+            body = given_date.group(2)
+        parts = body.rsplit(maxsplit=1)
+        if len(parts) != 2 or not parts[0].strip():
+            send(chat_id, "Формат: /income подработка 5000 или /income 23.09 подработка 5000")
+            return
+        try:
+            cents = parse_money(parts[1])
+        except ValueError as error:
+            send(chat_id, str(error))
+            return
+        with db() as connection:
+            connection.execute(
+                "INSERT INTO income(chat_id, description, amount_cents, received_on) VALUES (?, ?, ?, ?)",
+                (chat_id, parts[0].strip()[:300], cents, received_on.isoformat()),
+            )
+        send(chat_id, f"Записал доход за {received_on:%d.%m}: {parts[0]} — {money(cents)}")
+        return
+    if text == "/incomes":
+        send(chat_id, incomes_text(chat_id))
+        return
+    if text.startswith("/income_delete "):
+        part = text.split(maxsplit=1)[1]
+        if not part.isdigit():
+            send(chat_id, "Формат: /income_delete ID")
+            return
+        with db() as connection:
+            deleted = connection.execute(
+                "DELETE FROM income WHERE chat_id = ? AND id = ?", (chat_id, int(part))
+            ).rowcount
+        send(chat_id, "Доход удалён." if deleted else "Доход не найден.")
+        return
+    if text.startswith("/refund "):
+        parts = text[len("/refund "):].rsplit(maxsplit=1)
+        if len(parts) != 2 or not parts[0].strip():
+            send(chat_id, "Формат: /refund Еда 800")
+            return
+        try:
+            cents = parse_money(parts[1])
+        except ValueError as error:
+            send(chat_id, str(error))
+            return
+        reference = parts[0].lstrip("#")
+        comment = "Возврат"
+        if reference.isdigit():
+            details = expense_details(chat_id, int(reference))
+            if not details or details["total"] <= 0:
+                send(chat_id, "Покупка не найдена. Открой /history и возьми номер покупки.")
+                return
+            with db() as connection:
+                previous_refunds = connection.execute(
+                    """SELECT COALESCE(-SUM(amount_cents), 0) AS total FROM expenses
+                       WHERE chat_id = ? AND comment = ? AND amount_cents < 0""",
+                    (chat_id, f"Возврат #{reference}"),
+                ).fetchone()["total"]
+            if previous_refunds + cents > details["total"]:
+                send(chat_id, "Возврат не может быть больше суммы покупки.")
+                return
+            category = details["category"]
+            comment = f"Возврат #{reference}"
+        else:
+            category = normalize_category(parts[0])
+        if len(category) > 60:
+            send(chat_id, "Категория слишком длинная.")
+            return
+        today = user_today(user)
+        save_expenses(chat_id, [(category, comment, -cents)], today)
+        send(chat_id, f"Записал возврат за {today:%d.%m}: {category} −{money(cents)}")
+        return
+    if text.startswith("/goal"):
+        parts = text.split()
+        if len(parts) != 2:
+            send(chat_id, "Формат: /goal 20000 (или /goal 0, чтобы убрать)")
+            return
+        try:
+            cents = parse_money(parts[1], allow_zero=True)
+        except ValueError as error:
+            send(chat_id, str(error))
+            return
+        with db() as connection:
+            connection.execute("UPDATE users SET savings_goal_cents = ? WHERE chat_id = ?", (cents, chat_id))
+        send(chat_id, f"Цель накоплений: {money(cents)} в месяц.\n" + free_to_spend_text(get_user(chat_id), user_today(user)))
+        return
+    if text == "/free":
+        send(chat_id, free_to_spend_text(user, user_today(user)))
+        return
+    if text.startswith("/plan_delete "):
+        part = text.split(maxsplit=1)[1]
+        if not part.isdigit():
+            send(chat_id, "Формат: /plan_delete ID")
+            return
+        with db() as connection:
+            deleted = connection.execute(
+                "DELETE FROM planned_expenses WHERE chat_id = ? AND id = ?", (chat_id, int(part))
+            ).rowcount
+        send(chat_id, "План удалён." if deleted else "План не найден.")
+        return
+    if text in ("/plans", "/plan"):
+        send(chat_id, plans_text(chat_id, user_today(user)))
+        return
+    if text.startswith("/plan "):
+        match = re.fullmatch(rf"/plan\s+({DATE_TEXT})\s+(.+)\s+(\d+(?:\.\d{{1,2}})?)", text)
+        if not match:
+            send(chat_id, "Формат: /plan 15.10 стоматолог 15000")
+            return
+        try:
+            pieces = match.group(1).split(".")
+            year = int(pieces[2]) if len(pieces) == 3 else user_today(user).year
+            if year < 100:
+                year += 2000
+            planned_on = date(year, int(pieces[1]), int(pieces[0]))
+            cents = parse_money(match.group(3))
+        except ValueError:
+            send(chat_id, "Неверная дата или сумма.")
+            return
+        if planned_on < user_today(user):
+            send(chat_id, "Планируемая дата уже прошла.")
+            return
+        with db() as connection:
+            connection.execute(
+                "INSERT INTO planned_expenses(chat_id, description, amount_cents, planned_on) VALUES (?, ?, ?, ?)",
+                (chat_id, match.group(2).strip()[:300], cents, planned_on.isoformat()),
+            )
+        send(chat_id, f"Запланировал на {planned_on:%d.%m.%Y}: {match.group(2)} — {money(cents)}")
+        return
+    if text == "/settings":
+        send(chat_id, f"Часовой пояс: {user['timezone']}\nДень заканчивается в {user['day_cutoff_hour']:02d}:00\nНапоминания: {user['reminder_hours']}\nБюджет: {user['morning_hour']:02d}:00; прибыль: {user['profit_hour']:02d}:00\nИзменить: /settings cutoff 4, /settings reminders 20 22 0, /settings morning 9, /settings profit 10, /settings timezone Asia/Tomsk")
+        return
+    if text.startswith("/settings "):
+        parts = text.split()
+        key = parts[1] if len(parts) > 1 else ""
+        field = {"cutoff": "day_cutoff_hour", "morning": "morning_hour", "profit": "profit_hour"}.get(key)
+        if field and len(parts) == 3 and parts[2].isdigit() and 0 <= int(parts[2]) <= 23:
+            with db() as connection:
+                connection.execute(f"UPDATE users SET {field} = ? WHERE chat_id = ?", (int(parts[2]), chat_id))
+            send(chat_id, "Настройку сохранил.")
+            return
+        if key == "reminders" and len(parts) == 5 and len(set(parts[2:])) == 3 and all(p.isdigit() and 0 <= int(p) <= 23 for p in parts[2:]):
+            with db() as connection:
+                connection.execute("UPDATE users SET reminder_hours = ? WHERE chat_id = ?", (",".join(parts[2:]), chat_id))
+            send(chat_id, "Время трёх напоминаний сохранил.")
+            return
+        if key == "timezone" and len(parts) == 3:
+            try:
+                ZoneInfo(parts[2])
+            except (KeyError, ValueError):
+                send(chat_id, "Неизвестный часовой пояс. Пример: Asia/Tomsk")
+                return
+            with db() as connection:
+                connection.execute("UPDATE users SET timezone = ? WHERE chat_id = ?", (parts[2], chat_id))
+            send(chat_id, "Часовой пояс сохранил.")
+            return
+        send(chat_id, "Смотри форматы команд в /settings.")
         return
     if text.startswith("/report"):
         pieces = text.split()
@@ -1170,6 +1672,14 @@ def handle_message(message):
         return
     if text == "/compare":
         send(chat_id, comparison_text(chat_id, user_today(user)))
+        return
+    if text == "/compare_months":
+        send(chat_id, month_comparison_text(chat_id, user_today(user)))
+        return
+    if text == "/week":
+        today = user_today(user)
+        monday = today - timedelta(days=today.weekday())
+        send(chat_id, weekly_digest_text(chat_id, monday))
         return
     if text == "/history":
         history_text, keyboard = history_message(chat_id)
@@ -1268,6 +1778,9 @@ def handle_message(message):
             "Все твои траты в CSV",
         )
         return
+    if text == "/import":
+        send(chat_id, "Пришли CSV из /export как документ с подписью /import. Один и тот же файл повторно не загрузится.")
+        return
     if text == "/cancel":
         clear_pending_action(chat_id)
         send(chat_id, "Редактирование отменено.")
@@ -1354,6 +1867,10 @@ def handle_message(message):
             warning = category_limit_warning(chat_id, category, spent_on)
             if warning and warning not in response:
                 response.append(warning)
+            if spent_on == today:
+                anomaly = anomaly_text(chat_id, category, today)
+                if anomaly and anomaly not in response:
+                    response.append(anomaly)
     for category, comment, cents, spent_on in monthly_items:
         daily_cents, days_in_month = save_monthly_expense(
             chat_id,
@@ -1632,20 +2149,23 @@ def send_morning_update(user, today):
 
 
 def send_daily_profit(user, day):
-    if not user["salary_cents"] or was_sent(user["chat_id"], day, "daily_profit"):
+    monthly_salary = salary_for_day(user["chat_id"], day)
+    if not monthly_salary or was_sent(user["chat_id"], day, "daily_profit"):
         return
     days_in_month = calendar.monthrange(day.year, day.month)[1]
     daily_salary_cents = int(
-        (Decimal(user["salary_cents"]) / days_in_month).quantize(
+        (Decimal(monthly_salary) / days_in_month).quantize(
             Decimal("1"), rounding=ROUND_HALF_UP
         )
     )
     expenses_cents = spent(user["chat_id"], day, day)
+    other_income = income_total(user["chat_id"], day, day)
     message = (
         f"Итог за {day:%d.%m.%Y}:\n"
         f"Зарплата за день: {money(daily_salary_cents)}\n"
         f"Траты: {money(expenses_cents)}\n"
-        f"Прибыль за день: {money(daily_salary_cents - expenses_cents)}"
+        + (f"Другие доходы: {money(other_income)}\n" if other_income else "")
+        + f"Прибыль за день: {money(daily_salary_cents + other_income - expenses_cents)}"
     )
     if send(user["chat_id"], message) is not None:
         mark_sent(user["chat_id"], day, "daily_profit")
@@ -1657,30 +2177,33 @@ def run_schedule():
     for user in users:
         local_now = datetime.now(ZoneInfo(user["timezone"]))
         today = local_now.date()
-        expense_today = business_day(local_now)
+        expense_today = business_day(local_now, user["day_cutoff_hour"])
         hour, minute = local_now.hour, local_now.minute
         process_recurring(user, expense_today)
-        if hour == MORNING_HOUR and minute < 5:
+        if hour == max(user["morning_hour"], user["day_cutoff_hour"]) and minute < 5:
             send_morning_update(user, today)
-        if hour == 10 and minute < 5:
+        if hour == max(user["profit_hour"], user["day_cutoff_hour"]) and minute < 5:
             send_daily_profit(user, today - timedelta(days=1))
-        if hour == 20 and minute < 5:
-            reminder(
-                user["chat_id"], today, "reminder20",
+        if today.weekday() == 0 and hour == max(11, user["day_cutoff_hour"]) and minute < 5:
+            week_end = today - timedelta(days=1)
+            if not was_sent(user["chat_id"], week_end, "weekly_digest"):
+                if send(user["chat_id"], weekly_digest_text(user["chat_id"], today)) is not None:
+                    mark_sent(user["chat_id"], week_end, "weekly_digest")
+        if minute < 5:
+            reminder_hours = [int(value) for value in user["reminder_hours"].split(",")]
+            reminder_types = ["reminder20", "reminder22", "reminder00"]
+            default_texts = [
                 "Запиши сегодняшние траты. Например: еда 500, транспорт 250",
-            )
-        if hour == 22 and minute < 5:
-            reminder(
-                user["chat_id"], today, "reminder22",
                 "Напоминаю про траты 👀 Скинь всё одним сообщением через запятую.",
-            )
-        if hour == 0 and minute < 5:
-            yesterday = today - timedelta(days=1)
-            reminder(
-                user["chat_id"], yesterday, "reminder00",
                 "Последний догон за вчера: укажи дату, например «23.09 еда 500», или нажми «Вчера без трат».",
-                midnight=True,
-            )
+            ]
+            for index, reminder_hour in enumerate(reminder_hours):
+                if hour == reminder_hour:
+                    day = expense_today
+                    after_midnight = day != today
+                    label = "вчерашние" if after_midnight else "сегодняшние"
+                    message = default_texts[index] if reminder_hours == [20, 22, 0] and user["day_cutoff_hour"] == 4 else f"Запиши {label} траты. Например: еда 500, транспорт 250"
+                    reminder(user["chat_id"], day, reminder_types[index], message, midnight=after_midnight)
 
 
 def main():
