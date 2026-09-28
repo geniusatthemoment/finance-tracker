@@ -1549,19 +1549,20 @@ def handle_callback(callback):
         send(chat_id, message)
 
 
-def already_sent(chat_id, day, message_type):
+def was_sent(chat_id, day, message_type):
     with db() as connection:
-        exists = connection.execute(
+        return bool(connection.execute(
             "SELECT 1 FROM sent_messages WHERE chat_id = ? AND day = ? AND message_type = ?",
             (chat_id, day.isoformat(), message_type),
-        ).fetchone()
-        if exists:
-            return True
+        ).fetchone())
+
+
+def mark_sent(chat_id, day, message_type):
+    with db() as connection:
         connection.execute(
-            "INSERT INTO sent_messages(chat_id, day, message_type) VALUES (?, ?, ?)",
+            "INSERT OR IGNORE INTO sent_messages(chat_id, day, message_type) VALUES (?, ?, ?)",
             (chat_id, day.isoformat(), message_type),
         )
-    return False
 
 
 def is_acknowledged(chat_id, day):
@@ -1576,7 +1577,7 @@ def is_acknowledged(chat_id, day):
 def reminder(chat_id, day, message_type, text, midnight=False):
     if message_type != "reminder20" and is_acknowledged(chat_id, day):
         return
-    if already_sent(chat_id, day, message_type):
+    if was_sent(chat_id, day, message_type):
         return
     if message_type == "reminder20":
         with db() as connection:
@@ -1600,23 +1601,26 @@ def reminder(chat_id, day, message_type, text, midnight=False):
             )
     keyboard = {
         "inline_keyboard": [
-            [{"text": "Сегодня без трат", "callback_data": f"zero:{day.isoformat()}"}],
+            [{"text": "Вчера без трат" if midnight else "Сегодня без трат", "callback_data": f"zero:{day.isoformat()}"}],
             [{"text": "Уже всё записал", "callback_data": f"done:{day.isoformat()}"}],
         ]
     }
-    send(chat_id, text, keyboard)
+    if send(chat_id, text, keyboard) is not None:
+        mark_sent(chat_id, day, message_type)
 
 
 def send_morning_update(user, today):
     chat_id = user["chat_id"]
     if user["budget_cents"]:
-        if not already_sent(chat_id, today, "morning"):
-            send(chat_id, morning_text(user, today))
-    elif today.weekday() == 0 and not already_sent(chat_id, today, "budget_weekly"):
-        send(
+        if not was_sent(chat_id, today, "morning"):
+            if send(chat_id, morning_text(user, today)) is not None:
+                mark_sent(chat_id, today, "morning")
+    elif today.weekday() == 0 and not was_sent(chat_id, today, "budget_weekly"):
+        if send(
             chat_id,
             "Месячный бюджет пока не задан. Если нужен утренний расчёт, напиши /budget 70000.",
-        )
+        ) is not None:
+            mark_sent(chat_id, today, "budget_weekly")
 
 
 def run_schedule():
@@ -1643,7 +1647,7 @@ def run_schedule():
             yesterday = today - timedelta(days=1)
             reminder(
                 user["chat_id"], yesterday, "reminder00",
-                "Последний догон за вчера: укажи дату, например «23.09 еда 500», или нажми «Сегодня без трат».",
+                "Последний догон за вчера: укажи дату, например «23.09 еда 500», или нажми «Вчера без трат».",
                 midnight=True,
             )
 

@@ -1,8 +1,9 @@
 import os
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, datetime
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 import bot
 
@@ -335,6 +336,45 @@ class StorageTest(unittest.TestCase):
             )
         finally:
             bot.ALLOWED_USER_IDS = old_user_ids
+
+    def test_reminders_fire_at_20_22_and_midnight_once(self):
+        bot.ensure_user(1)
+
+        class FrozenDateTime(datetime):
+            current = None
+
+            @classmethod
+            def now(cls, tz=None):
+                return cls.current.astimezone(tz)
+
+        tz = ZoneInfo("Asia/Tomsk")
+        times = [(28, 20), (28, 22), (29, 0)]
+        with patch.object(bot, "datetime", FrozenDateTime), patch.object(
+            bot, "send", return_value={"message_id": 1}
+        ) as send_mock:
+            for day, hour in times:
+                FrozenDateTime.current = datetime(2026, 9, day, hour, tzinfo=tz)
+                bot.run_schedule()
+                bot.run_schedule()
+        self.assertEqual(send_mock.call_count, 3)
+        self.assertEqual(
+            [call.args[1] for call in send_mock.call_args_list],
+            [
+                "Запиши сегодняшние траты. Например: еда 500, транспорт 250",
+                "Напоминаю про траты 👀 Скинь всё одним сообщением через запятую.",
+                "Последний догон за вчера: укажи дату, например «23.09 еда 500», или нажми «Вчера без трат».",
+            ],
+        )
+        self.assertIn("Вчера без трат", str(send_mock.call_args.args[2]))
+
+    def test_failed_reminder_is_retried(self):
+        day = date(2026, 9, 28)
+        with patch.object(bot, "send", side_effect=[None, {"message_id": 1}]) as send_mock:
+            bot.reminder(1, day, "reminder22", "Запиши траты")
+            self.assertFalse(bot.was_sent(1, day, "reminder22"))
+            bot.reminder(1, day, "reminder22", "Запиши траты")
+        self.assertTrue(bot.was_sent(1, day, "reminder22"))
+        self.assertEqual(send_mock.call_count, 2)
 
 
 if __name__ == "__main__":
