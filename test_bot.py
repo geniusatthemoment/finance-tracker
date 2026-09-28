@@ -122,6 +122,53 @@ class StorageTest(unittest.TestCase):
         bot.save_expenses(1, [("еда", "обед", 50000), ("транспорт", "", 25000)], day)
         self.assertEqual(bot.spent(1, day, day), 75000)
 
+    def test_salary_is_per_user_and_report_shows_monthly_profit(self):
+        for chat_id in (1, 2):
+            bot.ensure_user(chat_id)
+        with bot.db() as connection:
+            connection.execute("UPDATE users SET salary_cents = ? WHERE chat_id = 1", (10000000,))
+        today = bot.user_today(bot.get_user(1))
+        bot.save_expenses(1, [("Еда", "", 2500000)], today)
+        self.assertIn("Прибыль за месяц (зарплата − траты на сегодня): 75 000 ₽", bot.report_text(bot.get_user(1)))
+        self.assertNotIn("Зарплата за месяц", bot.report_text(bot.get_user(2)))
+
+    def test_missing_budget_reminder_is_weekly(self):
+        bot.ensure_user(1)
+        user = bot.get_user(1)
+        monday = date(2026, 9, 28)
+        with patch.object(bot, "send") as send_mock:
+            bot.send_morning_update(user, monday)
+            bot.send_morning_update(user, monday)
+            bot.send_morning_update(user, monday + bot.timedelta(days=1))
+        self.assertEqual(send_mock.call_count, 1)
+        self.assertIn("бюджет пока не задан", send_mock.call_args.args[1])
+
+    def test_budget_still_gets_daily_morning_summary(self):
+        bot.ensure_user(1)
+        with bot.db() as connection:
+            connection.execute("UPDATE users SET budget_cents = ? WHERE chat_id = 1", (1000000,))
+        user = bot.get_user(1)
+        monday = date(2026, 9, 28)
+        with patch.object(bot, "send") as send_mock:
+            bot.send_morning_update(user, monday)
+            bot.send_morning_update(user, monday + bot.timedelta(days=1))
+        self.assertEqual(send_mock.call_count, 2)
+        self.assertIn("На сегодня:", send_mock.call_args.args[1])
+
+    def test_existing_users_table_gets_salary_column(self):
+        with bot.db() as connection:
+            connection.execute("DROP TABLE users")
+            connection.execute(
+                "CREATE TABLE users (chat_id INTEGER PRIMARY KEY, budget_cents INTEGER NOT NULL DEFAULT 0, timezone TEXT NOT NULL, created_at TEXT NOT NULL)"
+            )
+            connection.execute(
+                "INSERT INTO users(chat_id, budget_cents, timezone, created_at) VALUES (1, 123000, 'Asia/Tomsk', '2026-09-01')"
+            )
+        bot.init_db()
+        user = bot.get_user(1)
+        self.assertEqual(user["budget_cents"], 123000)
+        self.assertEqual(user["salary_cents"], 0)
+
     def test_users_data_is_isolated(self):
         day = date(2026, 9, 24)
         bot.ensure_user(563057258)

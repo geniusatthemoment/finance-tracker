@@ -68,6 +68,7 @@ def init_db():
             CREATE TABLE IF NOT EXISTS users (
                 chat_id INTEGER PRIMARY KEY,
                 budget_cents INTEGER NOT NULL DEFAULT 0,
+                salary_cents INTEGER NOT NULL DEFAULT 0,
                 timezone TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
@@ -134,6 +135,13 @@ def init_db():
             );
             """
         )
+        user_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(users)").fetchall()
+        }
+        if "salary_cents" not in user_columns:
+            connection.execute(
+                "ALTER TABLE users ADD COLUMN salary_cents INTEGER NOT NULL DEFAULT 0"
+            )
         columns = {
             row["name"] for row in connection.execute("PRAGMA table_info(expenses)").fetchall()
         }
@@ -965,8 +973,6 @@ def budget_snapshot(user, today):
 
 
 def morning_text(user, today):
-    if not user["budget_cents"]:
-        return "Доброе утро! Задай месячный бюджет командой /budget 70000."
     daily, week_left, month_left = budget_snapshot(user, today)
     lines = [
         "Доброе утро!",
@@ -997,8 +1003,17 @@ def report_text(user):
             """,
             (user["chat_id"], today.isoformat()),
         ).fetchone()["total"]
+    salary_lines = []
+    if user["salary_cents"]:
+        salary_lines = [
+            f"Зарплата за месяц: {money(user['salary_cents'])}",
+            f"Прибыль за месяц (зарплата − траты на сегодня): {money(user['salary_cents'] - current_total)}",
+        ]
     if not first:
-        return "Пока нет ни одной траты. Напиши, например: еда 500, транспорт 250"
+        return "\n".join(
+            ["Пока нет ни одной траты. Напиши, например: еда 500, транспорт 250"]
+            + salary_lines
+        )
 
     first_day = date.fromisoformat(first)
     observed_days = max((today - first_day).days + 1, 1)
@@ -1027,6 +1042,8 @@ def report_text(user):
         lines.append(f"• {row['category']}: {money(row['total'])} ({share}%)")
     if user["budget_cents"]:
         lines.extend(["", f"Остаток бюджета: {money(max(user['budget_cents'] - current_total, 0))}"])
+    if salary_lines:
+        lines.extend(["", *salary_lines])
     return "\n".join(lines)
 
 
@@ -1045,6 +1062,7 @@ def help_text():
         "Категория может быть любой. Сумму пиши без пробелов, дробную — через точку.\n\n"
         "Команды:\n"
         "/budget 70000 — бюджет на месяц\n"
+        "/salary 100000 — зарплата за месяц (0 — убрать)\n"
         "/report — отчет и выбор периода\n"
         "/report 01.09 15.09 — отчет за период\n"
         "/history — последние покупки и комментарии\n"
@@ -1093,6 +1111,21 @@ def handle_message(message):
         with db() as connection:
             connection.execute("UPDATE users SET budget_cents = ? WHERE chat_id = ?", (cents, chat_id))
         send(chat_id, f"Месячный бюджет сохранен: {money(cents)}")
+        return
+    if text.startswith("/salary"):
+        pieces = text.split()
+        if len(pieces) != 2 or not re.fullmatch(r"\d+(?:\.\d{1,2})?", pieces[1]):
+            send(chat_id, "Напиши зарплату за месяц так: /salary 100000 (или /salary 0, чтобы убрать)")
+            return
+        cents = int(Decimal(pieces[1]) * 100)
+        with db() as connection:
+            connection.execute(
+                "UPDATE users SET salary_cents = ? WHERE chat_id = ?", (cents, chat_id)
+            )
+        send(
+            chat_id,
+            f"Зарплата за месяц сохранена: {money(cents)}" if cents else "Зарплата удалена.",
+        )
         return
     if text.startswith("/report"):
         pieces = text.split()
@@ -1560,6 +1593,18 @@ def reminder(chat_id, day, message_type, text, midnight=False):
     send(chat_id, text, keyboard)
 
 
+def send_morning_update(user, today):
+    chat_id = user["chat_id"]
+    if user["budget_cents"]:
+        if not already_sent(chat_id, today, "morning"):
+            send(chat_id, morning_text(user, today))
+    elif today.weekday() == 0 and not already_sent(chat_id, today, "budget_weekly"):
+        send(
+            chat_id,
+            "Месячный бюджет пока не задан. Если нужен утренний расчёт, напиши /budget 70000.",
+        )
+
+
 def run_schedule():
     with db() as connection:
         users = connection.execute("SELECT * FROM users").fetchall()
@@ -1568,8 +1613,8 @@ def run_schedule():
         today = local_now.date()
         hour, minute = local_now.hour, local_now.minute
         process_recurring(user, today)
-        if hour == MORNING_HOUR and minute < 5 and not already_sent(user["chat_id"], today, "morning"):
-            send(user["chat_id"], morning_text(user, today))
+        if hour == MORNING_HOUR and minute < 5:
+            send_morning_update(user, today)
         if hour == 20 and minute < 5:
             reminder(
                 user["chat_id"], today, "reminder20",
