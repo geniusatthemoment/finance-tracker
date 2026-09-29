@@ -324,6 +324,77 @@ class StorageTest(unittest.TestCase):
         self.assertIn("Прибыль за месяц (зарплата − траты): 75 000 ₽", period)
         self.assertNotIn("Зарплата за месяц", bot.report_text(bot.get_user(2)))
 
+    def test_report_switches_to_calendar_month_on_october_first(self):
+        bot.ensure_user(1)
+        bot.save_expenses(1, [("Еда", "сентябрь", 100000)], date(2026, 9, 30))
+        bot.save_expenses(1, [("Транспорт", "октябрь", 20000)], date(2026, 10, 1))
+
+        class FrozenDateTime(datetime):
+            current = datetime(2026, 9, 30, 23, 59, tzinfo=ZoneInfo("Asia/Tomsk"))
+
+            @classmethod
+            def now(cls, tz=None):
+                return cls.current.astimezone(tz)
+
+        with patch.object(bot, "datetime", FrozenDateTime):
+            september = self.send_command(1, "/report")
+            FrozenDateTime.current = datetime(2026, 10, 1, 2, 30, tzinfo=ZoneInfo("Asia/Tomsk"))
+            october = self.send_command(1, "/report")
+        self.assertIn("Траты за текущий месяц", september)
+        self.assertIn("Календарный месяц: 10.2026", october)
+        self.assertIn("Всего: 200 ₽", october)
+        self.assertNotIn("1 000 ₽", october)
+
+    def test_month_report_includes_full_calendar_month_and_keeps_date_range(self):
+        bot.ensure_user(1)
+        bot.save_monthly_expense(1, "Зал", "абонемент", 310000, date(2026, 10, 1))
+        user = bot.get_user(1)
+        month = bot.monthly_report_text(user, date(2026, 10, 1))
+        self.assertIn("Всего: 3 100 ₽", month)
+        self.assertIn("В среднем в день: 100 ₽", month)
+        self.assertIn("31.10", month)
+        short = bot.period_report_text(1, date(2026, 10, 1), date(2026, 10, 1))
+        self.assertIn("Отчёт за 01.10.2026 — 01.10.2026", short)
+        self.assertIn("Всего: 100 ₽", short)
+
+    def test_month_navigation_and_future_month_validation(self):
+        bot.ensure_user(1)
+        today = date(2026, 10, 3)
+        self.assertEqual(bot.parse_report_month("09.2026", today), date(2026, 9, 1))
+        with self.assertRaises(ValueError):
+            bot.parse_report_month("11.2026", today)
+        keyboard = bot.report_keyboard(date(2026, 10, 1), date(2026, 10, 1))
+        self.assertIn("report_month:2026-09", str(keyboard))
+        self.assertNotIn("report_month:2026-11", str(keyboard))
+
+    def test_report_month_command_and_callback_show_selected_month(self):
+        bot.ensure_user(1)
+        bot.save_expenses(1, [("Еда", "", 50000)], date(2026, 9, 15))
+
+        class FrozenDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return datetime(2026, 10, 3, 12, tzinfo=ZoneInfo("Asia/Tomsk")).astimezone(tz)
+
+        old_ids = bot.ALLOWED_USER_IDS
+        bot.ALLOWED_USER_IDS = frozenset({1})
+        try:
+            with patch.object(bot, "datetime", FrozenDateTime), patch.object(bot, "send") as sender, patch.object(bot, "api"):
+                bot.handle_message({"from": {"id": 1}, "chat": {"id": 1}, "text": "/report 09.2026"})
+                self.assertIn("Календарный месяц: 09.2026", sender.call_args.args[1])
+                bot.handle_callback({
+                    "id": "callback", "from": {"id": 1}, "data": "report_month:2026-09",
+                    "message": {"message_id": 10, "chat": {"id": 1}},
+                })
+                self.assertIn("Всего: 500 ₽", sender.call_args.args[1])
+                bot.handle_callback({
+                    "id": "callback2", "from": {"id": 1}, "data": "report:month",
+                    "message": {"message_id": 11, "chat": {"id": 1}},
+                })
+                self.assertIn("Календарный месяц: 10.2026", sender.call_args.args[1])
+        finally:
+            bot.ALLOWED_USER_IDS = old_ids
+
     def test_missing_budget_reminder_is_weekly(self):
         bot.ensure_user(1)
         user = bot.get_user(1)

@@ -44,6 +44,7 @@ ALLOWED_USER_IDS = parse_allowed_user_ids(
 DB_PATH = os.environ.get("DATABASE_PATH", "expenses.db")
 DEFAULT_TIMEZONE = os.environ.get("BOT_TIMEZONE", "Asia/Tomsk")
 MORNING_HOUR = int(os.environ.get("MORNING_HOUR", "9"))
+MONTHLY_REPORT_START = date(2026, 10, 1)
 API_URL = "https://api.telegram.org/bot{}/{}"
 
 EXPENSE_RE = re.compile(
@@ -391,6 +392,10 @@ def business_day(local_now, cutoff_hour=4):
 
 def user_today(user):
     return business_day(datetime.now(ZoneInfo(user["timezone"])), user["day_cutoff_hour"])
+
+
+def user_calendar_today(user):
+    return datetime.now(ZoneInfo(user["timezone"])).date()
 
 
 def get_user(chat_id):
@@ -819,17 +824,23 @@ def period_report_text(chat_id, start, end):
     return "\n".join(lines)
 
 
-def report_keyboard():
-    return {
-        "inline_keyboard": [
+def report_keyboard(month_start=None, current_month=None):
+    rows = [
             [
                 {"text": "Сегодня", "callback_data": "report:today"},
                 {"text": "Неделя", "callback_data": "report:week"},
                 {"text": "Месяц", "callback_data": "report:month"},
             ],
             [{"text": "Сравнить недели", "callback_data": "report:compare"}],
-        ]
-    }
+    ]
+    if month_start is not None:
+        previous = (month_start - timedelta(days=1)).replace(day=1)
+        navigation = [{"text": "← Предыдущий месяц", "callback_data": f"report_month:{previous:%Y-%m}"}]
+        next_month = (month_start + timedelta(days=32)).replace(day=1)
+        if current_month is None or next_month <= current_month:
+            navigation.append({"text": "Следующий месяц →", "callback_data": f"report_month:{next_month:%Y-%m}"})
+        rows.insert(0, navigation)
+    return {"inline_keyboard": rows}
 
 
 def comparison_text(chat_id, today):
@@ -1316,7 +1327,41 @@ def morning_text(user, today):
     return "\n".join(lines)
 
 
+def parse_report_month(value, calendar_today):
+    match = re.fullmatch(r"(0?[1-9]|1[0-2])\.(\d{4})", value)
+    if not match:
+        raise ValueError("Формат месяца: /report 10.2026")
+    month = date(int(match.group(2)), int(match.group(1)), 1)
+    if month > calendar_today.replace(day=1):
+        raise ValueError("Будущий месяц пока недоступен.")
+    return month
+
+
+def monthly_report_text(user, month_start):
+    """Report one complete calendar month, including monthly allocations."""
+    month_end = month_start.replace(
+        day=calendar.monthrange(month_start.year, month_start.month)[1]
+    )
+    chat_id = user["chat_id"]
+    total = spent(chat_id, month_start, month_end)
+    days_in_month = month_end.day
+    text = period_report_text(chat_id, month_start, month_end)
+    lines = text.splitlines()
+    lines[0] = f"Календарный месяц: {month_start:%m.%Y} ({month_start:%d.%m}–{month_end:%d.%m})"
+    lines.insert(2, f"В среднем в неделю: {money(total * 7 // days_in_month)}")
+    is_current_month = month_start == user_calendar_today(user).replace(day=1)
+    if is_current_month and user["budget_cents"]:
+        lines.extend(["", f"Остаток месячного бюджета: {money(user['budget_cents'] - total)}"])
+    if is_current_month and user["savings_goal_cents"]:
+        profit = salary_month_total(chat_id, month_start) + income_total(chat_id, month_start, month_end) - total
+        lines.append(f"После цели накоплений: {money(profit - user['savings_goal_cents'])}")
+    return "\n".join(lines)
+
+
 def report_text(user):
+    calendar_today = user_calendar_today(user)
+    if calendar_today >= MONTHLY_REPORT_START:
+        return monthly_report_text(user, calendar_today.replace(day=1))
     today = user_today(user)
     month_start = today.replace(day=1)
     current_total = spent(user["chat_id"], month_start, today)
@@ -1401,7 +1446,8 @@ def help_text():
         "/refund 123 800 — возврат покупки #123 (номер в /history)\n"
         "/goal 20000 — цель накоплений; /free — свободные деньги\n"
         "/plan 15.10 стоматолог 15000 — будущая трата; /plans — список\n"
-        "/report — отчет и выбор периода\n"
+        "/report — с октября отчёт за календарный месяц\n"
+        "/report 10.2026 — конкретный месяц\n"
         "/report 01.09 15.09 — отчет за период\n"
         "/history — последние покупки и комментарии\n"
         "/limits — лимиты категорий\n"
@@ -1652,16 +1698,30 @@ def handle_message(message):
         return
     if text.startswith("/report"):
         pieces = text.split()
+        calendar_today = user_calendar_today(user)
+        calendar_month = calendar_today.replace(day=1)
         if len(pieces) == 1:
-            send(chat_id, report_text(user), report_keyboard())
+            keyboard = (
+                report_keyboard(calendar_month, calendar_month)
+                if calendar_today >= MONTHLY_REPORT_START else report_keyboard()
+            )
+            send(chat_id, report_text(user), keyboard)
+            return
+        if len(pieces) == 2:
+            try:
+                month = parse_report_month(pieces[1], calendar_today)
+            except ValueError as error:
+                send(chat_id, str(error))
+                return
+            send(chat_id, monthly_report_text(user, month), report_keyboard(month, calendar_month))
             return
         if len(pieces) != 3:
-            send(chat_id, "Формат: /report 01.09 15.09")
+            send(chat_id, "Формат: /report 10.2026 или /report 01.09 15.09")
             return
         today = user_today(user)
         try:
-            start = parse_date(pieces[1], today)
-            end = parse_date(pieces[2], today)
+            start = parse_date(pieces[1], today, calendar_today)
+            end = parse_date(pieces[2], today, calendar_today)
         except ValueError as error:
             send(chat_id, str(error))
             return
@@ -1992,6 +2052,18 @@ def handle_callback(callback):
         )
         if deleted:
             send(chat_id, f"Удалил: {deleted['category']} — {money(deleted['total'])}")
+    elif data.startswith("report_month:"):
+        month_code = data.split(":", 1)[1]
+        try:
+            month = date.fromisoformat(month_code + "-01")
+        except ValueError:
+            return
+        current_month = user_calendar_today(user).replace(day=1)
+        if month > current_month:
+            api("answerCallbackQuery", callback_query_id=callback["id"], text="Будущий месяц пока недоступен")
+            return
+        api("answerCallbackQuery", callback_query_id=callback["id"])
+        send(chat_id, monthly_report_text(user, month), report_keyboard(month, current_month))
     elif data.startswith("report:"):
         period = data.split(":", 1)[1]
         today = user_today(user)
@@ -2002,14 +2074,24 @@ def handle_callback(callback):
             start = today - timedelta(days=today.weekday())
             text = period_report_text(chat_id, start, today)
         elif period == "month":
-            start = today.replace(day=1)
-            text = period_report_text(chat_id, start, today)
+            calendar_today = user_calendar_today(user)
+            if calendar_today >= MONTHLY_REPORT_START:
+                month = calendar_today.replace(day=1)
+                text = monthly_report_text(user, month)
+            else:
+                start = today.replace(day=1)
+                text = period_report_text(chat_id, start, today)
         elif period == "compare":
             text = comparison_text(chat_id, today)
         else:
             return
         api("answerCallbackQuery", callback_query_id=callback["id"])
-        send(chat_id, text, report_keyboard())
+        keyboard = (
+            report_keyboard(month, calendar_today.replace(day=1))
+            if period == "month" and calendar_today >= MONTHLY_REPORT_START
+            else report_keyboard()
+        )
+        send(chat_id, text, keyboard)
     elif data.startswith("recurring_delete:"):
         try:
             recurring_id = int(data.split(":", 1)[1])
