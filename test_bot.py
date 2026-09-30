@@ -322,6 +322,51 @@ class StorageTest(unittest.TestCase):
             [("Транспорт", 20500), ("Автобус", 16100), ("Такси", 4000)],
         )
 
+    def test_remaining_transport_becomes_taxi_once_for_first_user(self):
+        first_user, second_user = 563057258, 656675199
+        day = date(2026, 9, 29)
+        bot.ensure_user(first_user)
+        bot.ensure_user(second_user)
+        bot.save_expenses(first_user, [
+            ("Автобус", "", 4000),
+            ("Транспорт", "", 12500),
+            ("Транспорт", "такси туда", 16000),
+            ("Транспорт", "такси обратно", 21000),
+            ("Такси", "", 5000),
+        ], day)
+        bot.save_expenses(second_user, [("Транспорт", "", 12500)], day)
+        migration = "563057258_remaining_transport_to_taxi_2026_09_30"
+        with bot.db() as connection:
+            connection.execute("DELETE FROM data_migrations WHERE name = ?", (migration,))
+
+        bot.init_db()
+        with bot.db() as connection:
+            rows = connection.execute(
+                "SELECT category, amount_cents FROM expenses WHERE chat_id = ? ORDER BY id",
+                (first_user,),
+            ).fetchall()
+            count = connection.execute(
+                "SELECT affected_rows FROM data_migrations WHERE name = ?", (migration,)
+            ).fetchone()["affected_rows"]
+            audited = connection.execute(
+                "SELECT COUNT(*) AS count FROM data_migration_expenses WHERE migration_name = ?",
+                (migration,),
+            ).fetchone()["count"]
+        self.assertEqual(
+            [(row["category"], row["amount_cents"]) for row in rows],
+            [("Автобус", 4000), ("Такси", 12500), ("Такси", 16000),
+             ("Такси", 21000), ("Такси", 5000)],
+        )
+        self.assertEqual(count, 3)
+        self.assertEqual(audited, 3)
+        self.assertEqual(bot.category_totals(second_user, day, day)[0]["category"], "Транспорт")
+
+        bot.save_expenses(first_user, [("Транспорт", "", 3000)], day)
+        bot.init_db()
+        self.assertEqual(
+            bot.category_totals(first_user, day, day)[-1]["category"], "Транспорт"
+        )
+
     def test_custom_reminder_hour_runs_once(self):
         bot.ensure_user(1)
         with bot.db() as connection:

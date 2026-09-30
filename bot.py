@@ -243,6 +243,32 @@ def init_db():
             if updated:
                 print(f"One-time bus category migration: {updated} expense(s)", flush=True)
 
+        migration = "563057258_remaining_transport_to_taxi_2026_09_30"
+        if not connection.execute(
+            "SELECT 1 FROM data_migrations WHERE name = ?", (migration,)
+        ).fetchone():
+            targets = connection.execute(
+                """SELECT id, category FROM expenses
+                   WHERE chat_id = ? AND category = 'Транспорт'""",
+                (563057258,),
+            ).fetchall()
+            connection.executemany(
+                """INSERT INTO data_migration_expenses(migration_name, expense_id, old_category)
+                   VALUES (?, ?, ?)""",
+                [(migration, row["id"], row["category"]) for row in targets],
+            )
+            connection.executemany(
+                "UPDATE expenses SET category = 'Такси' WHERE id = ?",
+                [(row["id"],) for row in targets],
+            )
+            updated = len(targets)
+            connection.execute(
+                "INSERT INTO data_migrations(name, applied_at, affected_rows) VALUES (?, ?, ?)",
+                (migration, datetime.utcnow().isoformat(), updated),
+            )
+            if updated:
+                print(f"One-time taxi category migration: {updated} expense(s)", flush=True)
+
 
 def api(method, **params):
     body = urllib.parse.urlencode(params).encode()
