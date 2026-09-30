@@ -164,6 +164,19 @@ def init_db():
                 sha256 TEXT NOT NULL,
                 PRIMARY KEY (chat_id, sha256)
             );
+
+            CREATE TABLE IF NOT EXISTS data_migrations (
+                name TEXT PRIMARY KEY,
+                applied_at TEXT NOT NULL,
+                affected_rows INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS data_migration_expenses (
+                migration_name TEXT NOT NULL,
+                expense_id INTEGER NOT NULL,
+                old_category TEXT NOT NULL,
+                PRIMARY KEY (migration_name, expense_id)
+            );
             """
         )
         user_columns = {
@@ -202,6 +215,33 @@ def init_db():
             "UPDATE expenses SET category = ? WHERE id = ?",
             [(normalize_category(row["category"]), row["id"]) for row in rows],
         )
+        migration = "563057258_transport_small_fares_to_bus_2026_09_30"
+        if not connection.execute(
+            "SELECT 1 FROM data_migrations WHERE name = ?", (migration,)
+        ).fetchone():
+            targets = connection.execute(
+                """SELECT id, category FROM expenses
+                   WHERE chat_id = ? AND category = 'Транспорт'
+                   AND amount_cents IN (4000, 4100, 8000)
+                   AND batch_id IS NULL""",
+                (563057258,),
+            ).fetchall()
+            connection.executemany(
+                """INSERT INTO data_migration_expenses(migration_name, expense_id, old_category)
+                   VALUES (?, ?, ?)""",
+                [(migration, row["id"], row["category"]) for row in targets],
+            )
+            connection.executemany(
+                "UPDATE expenses SET category = 'Автобус' WHERE id = ?",
+                [(row["id"],) for row in targets],
+            )
+            updated = len(targets)
+            connection.execute(
+                "INSERT INTO data_migrations(name, applied_at, affected_rows) VALUES (?, ?, ?)",
+                (migration, datetime.utcnow().isoformat(), updated),
+            )
+            if updated:
+                print(f"One-time bus category migration: {updated} expense(s)", flush=True)
 
 
 def api(method, **params):

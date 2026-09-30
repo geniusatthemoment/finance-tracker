@@ -268,6 +268,60 @@ class StorageTest(unittest.TestCase):
         self.assertEqual(bot.spent(1, day, day), 50000)
         self.assertEqual(bot.get_user(1)["day_cutoff_hour"], 4)
 
+    def test_bus_reclassification_is_one_time_and_only_for_first_user(self):
+        first_user, second_user = 563057258, 656675199
+        day = date(2026, 9, 27)
+        for chat_id in (first_user, second_user):
+            bot.ensure_user(chat_id)
+        bot.save_expenses(first_user, [
+            ("транспорт", "", 4000),
+            ("Транспорт", "", 4100),
+            ("Транспорт", "", 8000),
+            ("Транспорт", "", 12500),
+            ("Такси", "", 4000),
+        ], day)
+        bot.save_expenses(second_user, [("Транспорт", "", 4000)], day)
+        with bot.db() as connection:
+            connection.execute(
+                """INSERT INTO expenses(chat_id, category, comment, amount_cents, spent_on, created_at, batch_id)
+                   VALUES (?, 'Транспорт', '', 4000, ?, '2026-09-27', 'monthly')""",
+                (first_user, day.isoformat()),
+            )
+            connection.execute(
+                "DELETE FROM data_migrations WHERE name = ?",
+                ("563057258_transport_small_fares_to_bus_2026_09_30",),
+            )
+
+        bot.init_db()
+        with bot.db() as connection:
+            rows = connection.execute(
+                "SELECT category, amount_cents FROM expenses WHERE chat_id = ? ORDER BY id",
+                (first_user,),
+            ).fetchall()
+            count = connection.execute(
+                "SELECT affected_rows FROM data_migrations WHERE name = ?",
+                ("563057258_transport_small_fares_to_bus_2026_09_30",),
+            ).fetchone()["affected_rows"]
+            audited = connection.execute(
+                "SELECT COUNT(*) AS count FROM data_migration_expenses WHERE migration_name = ?",
+                ("563057258_transport_small_fares_to_bus_2026_09_30",),
+            ).fetchone()["count"]
+        self.assertEqual(
+            [(row["category"], row["amount_cents"]) for row in rows],
+            [("Автобус", 4000), ("Автобус", 4100), ("Автобус", 8000),
+             ("Транспорт", 12500), ("Такси", 4000), ("Транспорт", 4000)],
+        )
+        self.assertEqual(count, 3)
+        self.assertEqual(audited, 3)
+        self.assertEqual(bot.category_totals(second_user, day, day)[0]["category"], "Транспорт")
+
+        bot.save_expenses(first_user, [("Транспорт", "", 4000)], day)
+        bot.init_db()
+        self.assertEqual(
+            [(row["category"], row["total"]) for row in bot.category_totals(first_user, day, day)],
+            [("Транспорт", 20500), ("Автобус", 16100), ("Такси", 4000)],
+        )
+
     def test_custom_reminder_hour_runs_once(self):
         bot.ensure_user(1)
         with bot.db() as connection:
