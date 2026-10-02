@@ -418,7 +418,12 @@ class StorageTest(unittest.TestCase):
             connection.execute("UPDATE users SET salary_cents = ? WHERE chat_id = 1", (10000000,))
         today = bot.user_today(bot.get_user(1))
         bot.save_expenses(1, [("Еда", "", 2500000)], today)
-        self.assertIn("Прибыль за месяц (зарплата − траты на сегодня): 75 000 ₽", bot.report_text(bot.get_user(1)))
+        expected_profit = (
+            "Прибыль за месяц (зарплата − траты): 75 000 ₽"
+            if bot.user_calendar_today(bot.get_user(1)) >= bot.MONTHLY_REPORT_START
+            else "Прибыль за месяц (зарплата − траты на сегодня): 75 000 ₽"
+        )
+        self.assertIn(expected_profit, bot.report_text(bot.get_user(1)))
         period = bot.period_report_text(1, today.replace(day=1), today)
         self.assertIn("Прибыль за месяц (зарплата − траты): 75 000 ₽", period)
         self.assertNotIn("Зарплата за месяц", bot.report_text(bot.get_user(2)))
@@ -455,6 +460,37 @@ class StorageTest(unittest.TestCase):
         short = bot.period_report_text(1, date(2026, 10, 1), date(2026, 10, 1))
         self.assertIn("Отчёт за 01.10.2026 — 01.10.2026", short)
         self.assertIn("Всего: 100 ₽", short)
+
+    def test_current_month_average_uses_recorded_days_only(self):
+        bot.ensure_user(1)
+        bot.save_expenses(1, [("Еда", "", 50000)], date(2026, 10, 1))
+
+        class FrozenDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 10, 2, 12, 0, tzinfo=ZoneInfo("Asia/Tomsk")).astimezone(tz)
+
+        with patch.object(bot, "datetime", FrozenDateTime):
+            report = bot.report_text(bot.get_user(1))
+        self.assertIn("Всего: 500 ₽", report)
+        self.assertIn("В среднем в день: 500 ₽", report)
+        self.assertIn("В среднем в неделю: 3 500 ₽", report)
+        self.assertIn("В среднем в месяц (прогноз на 30 дней): 15 000 ₽", report)
+
+    def test_current_month_average_ignores_future_monthly_allocations(self):
+        bot.ensure_user(1)
+        bot.save_monthly_expense(1, "Зал", "", 310000, date(2026, 10, 1))
+
+        class FrozenDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 10, 2, 12, 0, tzinfo=ZoneInfo("Asia/Tomsk")).astimezone(tz)
+
+        with patch.object(bot, "datetime", FrozenDateTime):
+            report = bot.report_text(bot.get_user(1))
+        self.assertIn("Всего: 3 100 ₽", report)
+        self.assertIn("В среднем в день: 100 ₽", report)
+        self.assertIn("В среднем в месяц (прогноз на 30 дней): 3 000 ₽", report)
 
     def test_month_navigation_and_future_month_validation(self):
         bot.ensure_user(1)

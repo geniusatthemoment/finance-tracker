@@ -1416,6 +1416,16 @@ def monthly_report_text(user, month_start):
     lines[0] = f"Календарный месяц: {month_start:%m.%Y} ({month_start:%d.%m}–{month_end:%d.%m})"
     lines.insert(2, f"В среднем в неделю: {money(total * 7 // days_in_month)}")
     is_current_month = month_start == user_calendar_today(user).replace(day=1)
+    if is_current_month:
+        # Future monthly allocations remain in the full-month total, but they
+        # must not dilute or inflate the average of days recorded so far.
+        observed_end = min(user_today(user), month_end)
+        observed_rows = daily_totals(chat_id, month_start, observed_end)
+        observed_days = len(observed_rows)
+        average_day = sum(row["total"] for row in observed_rows) // observed_days if observed_days else 0
+        lines[2] = f"В среднем в неделю: {money(average_day * 7)}"
+        lines[3] = f"В среднем в день: {money(average_day)}"
+        lines.insert(4, f"В среднем в месяц (прогноз на 30 дней): {money(average_day * 30)}")
     if is_current_month and user["budget_cents"]:
         lines.extend(["", f"Остаток месячного бюджета: {money(user['budget_cents'] - total)}"])
     if is_current_month and user["savings_goal_cents"]:
