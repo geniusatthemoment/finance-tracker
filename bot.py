@@ -842,7 +842,7 @@ def replace_expense(chat_id, expense_id, item, today):
     return category, comment, cents, spent_on, monthly
 
 
-def period_report_text(chat_id, start, end):
+def period_report_text(chat_id, start, end, zero_through=None):
     total = spent(chat_id, start, end)
     rows = daily_totals(chat_id, start, end)
     categories = category_totals(chat_id, start, end, 10)
@@ -854,7 +854,20 @@ def period_report_text(chat_id, start, end):
         "",
         "По дням:",
     ]
-    if rows:
+    if zero_through is not None:
+        amounts_by_day = {row["spent_on"]: row["total"] for row in rows}
+        day = start
+        while day <= min(zero_through, end):
+            amounts_by_day.setdefault(day.isoformat(), 0)
+            day += timedelta(days=1)
+        if amounts_by_day:
+            lines.extend(
+                f"• {date.fromisoformat(day_key):%d.%m} — {money(amounts_by_day[day_key])}"
+                for day_key in sorted(amounts_by_day)
+            )
+        else:
+            lines.append("• Нет трат")
+    elif rows:
         lines.extend(
             f"• {date.fromisoformat(row['spent_on']):%d.%m} — {money(row['total'])}"
             for row in rows
@@ -1411,11 +1424,12 @@ def monthly_report_text(user, month_start):
     chat_id = user["chat_id"]
     total = spent(chat_id, month_start, month_end)
     days_in_month = month_end.day
-    text = period_report_text(chat_id, month_start, month_end)
+    is_current_month = month_start == user_calendar_today(user).replace(day=1)
+    zero_through = min(user_today(user), month_end) if is_current_month else month_end
+    text = period_report_text(chat_id, month_start, month_end, zero_through=zero_through)
     lines = text.splitlines()
     lines[0] = f"Календарный месяц: {month_start:%m.%Y} ({month_start:%d.%m}–{month_end:%d.%m})"
     lines.insert(2, f"В среднем в неделю: {money(total * 7 // days_in_month)}")
-    is_current_month = month_start == user_calendar_today(user).replace(day=1)
     if is_current_month:
         # Future monthly allocations remain in the full-month total, but they
         # must not dilute or inflate the average of days recorded so far.

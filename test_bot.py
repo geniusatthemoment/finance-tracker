@@ -492,6 +492,34 @@ class StorageTest(unittest.TestCase):
         self.assertIn("В среднем в день: 100 ₽", report)
         self.assertIn("В среднем в месяц (прогноз на 30 дней): 3 000 ₽", report)
 
+    def test_current_month_report_shows_zero_spend_days_after_day_starts(self):
+        bot.ensure_user(1)
+        bot.save_expenses(1, [("Еда", "", 50000)], date(2026, 10, 1))
+
+        class FrozenDateTime(datetime):
+            current = datetime(2026, 10, 5, 3, 0, tzinfo=ZoneInfo("Asia/Tomsk"))
+
+            @classmethod
+            def now(cls, tz=None):
+                return cls.current.astimezone(tz)
+
+        with patch.object(bot, "datetime", FrozenDateTime):
+            before_cutoff = bot.report_text(bot.get_user(1))
+            FrozenDateTime.current = datetime(2026, 10, 5, 12, 0, tzinfo=ZoneInfo("Asia/Tomsk"))
+            after_cutoff = bot.report_text(bot.get_user(1))
+        self.assertIn("• 04.10 — 0 ₽", before_cutoff)
+        self.assertNotIn("• 05.10 — 0 ₽", before_cutoff)
+        self.assertIn("• 05.10 — 0 ₽", after_cutoff)
+        self.assertNotIn("• 06.10 — 0 ₽", after_cutoff)
+        self.assertIn("В среднем в день: 500 ₽", after_cutoff)
+
+    def test_past_calendar_month_report_shows_zero_spend_days(self):
+        bot.ensure_user(1)
+        bot.save_expenses(1, [("Еда", "", 50000)], date(2026, 9, 1))
+        report = bot.monthly_report_text(bot.get_user(1), date(2026, 9, 1))
+        self.assertIn("• 02.09 — 0 ₽", report)
+        self.assertIn("• 30.09 — 0 ₽", report)
+
     def test_month_navigation_and_future_month_validation(self):
         bot.ensure_user(1)
         today = date(2026, 10, 3)
