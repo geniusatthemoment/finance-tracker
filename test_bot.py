@@ -567,6 +567,45 @@ class StorageTest(unittest.TestCase):
         report = bot.category_report_text(1, "Продукты", date(2026, 10, 1))
         self.assertIn("Пилад: 150 ₽ (100%, покупок: 2)", report)
 
+    def test_place_report_combines_categories_and_shows_month_and_all_time(self):
+        bot.ensure_user(1)
+        bot.ensure_user(2)
+        bot.save_expenses(1, [("Продукты", "ПИЛАД", "семечки", 10000)], date(2026, 10, 5))
+        bot.save_expenses(1, [("Еда", "пилад", "обед", 20000)], date(2026, 10, 5))
+        bot.save_expenses(1, [("Продукты", "Пилад", "сентябрь", 30000)], date(2026, 9, 30))
+        bot.save_expenses(2, [("Еда", "Пилад", "чужая", 900000)], date(2026, 10, 5))
+
+        class FrozenDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 10, 6, 12, 0, tzinfo=ZoneInfo("Asia/Tomsk")).astimezone(tz)
+
+        with patch.object(bot, "datetime", FrozenDateTime):
+            current = self.send_command(1, "/place пИЛАД")
+            september = self.send_command(1, "/place Пилад 09.2026")
+        self.assertIn("Место «Пилад»", current)
+        self.assertIn("За 10.2026:\nПотрачено: 300 ₽\nПокупок: 2", current)
+        self.assertIn("За всё время:\nПотрачено: 600 ₽\nПокупок: 3", current)
+        self.assertIn("• Еда: 200 ₽", current)
+        self.assertIn("• Продукты: 100 ₽", current)
+        self.assertIn("· Еда · 200 ₽ · обед", current)
+        self.assertNotIn("9 000 ₽", current)
+        self.assertIn("За 09.2026:\nПотрачено: 300 ₽\nПокупок: 1", september)
+        self.assertIn("· Продукты · 300 ₽ · сентябрь", september)
+        self.assertNotIn("· Еда · 200 ₽ · обед", september)
+
+    def test_place_report_accepts_multiword_name_and_monthly_allocation(self):
+        bot.ensure_user(1)
+        bot.save_monthly_expense(
+            1, "Зал", "абонемент", 310000, date(2026, 10, 1), place="Библио вендинг"
+        )
+        report = self.send_command(1, "/place библио ВЕНДИНГ 10.2026")
+        self.assertIn("Место «Библио вендинг»", report)
+        self.assertIn("Потрачено: 3 100 ₽\nПокупок: 1", report)
+        self.assertIn("01.10.2026–31.10.2026", report)
+        self.assertIn("Трат в месте «Нет» пока нет.", self.send_command(1, "/place нет"))
+        self.assertIn("Напиши /place", self.send_command(1, "/place"))
+
     def test_monthly_allocation_keeps_place_and_counts_as_one_purchase(self):
         bot.ensure_user(1)
         bot.save_monthly_expense(

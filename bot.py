@@ -749,6 +749,68 @@ def category_report_text(chat_id, category, month_start):
     return "\n".join(lines)
 
 
+def place_report_text(chat_id, place, month_start):
+    place = normalize_place(place)
+    month_end = month_start.replace(
+        day=calendar.monthrange(month_start.year, month_start.month)[1]
+    )
+    with db() as connection:
+        def breakdown(start=None, end=None):
+            period_filter = "AND spent_on BETWEEN ? AND ?" if start else ""
+            params = (chat_id, place, start.isoformat(), end.isoformat()) if start else (chat_id, place)
+            return connection.execute(
+                f"""SELECT category, SUM(amount_cents) AS total,
+                           COUNT(DISTINCT CASE WHEN amount_cents > 0 THEN
+                               CASE WHEN batch_id IS NULL THEN 'expense:' || id
+                                    ELSE 'batch:' || batch_id END
+                           END) AS purchases
+                    FROM expenses WHERE chat_id = ? AND place = ? {period_filter}
+                    GROUP BY category ORDER BY total DESC, category""",
+                params,
+            ).fetchall()
+
+        monthly = breakdown(month_start, month_end)
+        all_time = breakdown()
+        recent = connection.execute(
+            """SELECT category, comment, SUM(amount_cents) AS total,
+                      MIN(spent_on) AS first_day, MAX(spent_on) AS last_day
+               FROM expenses WHERE chat_id = ? AND place = ?
+                 AND spent_on BETWEEN ? AND ?
+               GROUP BY CASE WHEN batch_id IS NULL THEN 'expense:' || id
+                             ELSE 'batch:' || batch_id END
+               ORDER BY MAX(spent_on) DESC, MAX(id) DESC LIMIT 10""",
+            (chat_id, place, month_start.isoformat(), month_end.isoformat()),
+        ).fetchall()
+    if not all_time:
+        return f"Трат в месте «{place}» пока нет."
+
+    def period_lines(title, categories):
+        total = sum(row["total"] for row in categories)
+        purchases = sum(row["purchases"] for row in categories)
+        result = [title, f"Потрачено: {money(total)}", f"Покупок: {purchases}"]
+        if categories:
+            result.append("По категориям:")
+            result.extend(f"• {row['category']}: {money(row['total'])}" for row in categories[:5])
+            if len(categories) > 5:
+                result.append(f"• Остальные: {money(sum(row['total'] for row in categories[5:]))}")
+        return result
+
+    lines = [f"Место «{place}»", ""]
+    lines.extend(period_lines(f"За {month_start:%m.%Y}:", monthly))
+    lines.extend(["", *period_lines("За всё время:", all_time), "", "Покупки за выбранный месяц (последние 10):"])
+    if not recent:
+        lines.append("• Нет трат")
+    for row in recent:
+        first_day = date.fromisoformat(row["first_day"])
+        last_day = date.fromisoformat(row["last_day"])
+        period = f"{first_day:%d.%m.%Y}"
+        if last_day != first_day:
+            period += f"–{last_day:%d.%m.%Y}"
+        comment = f" · {row['comment'][:80]}" if row["comment"] else ""
+        lines.append(f"• {period} · {row['category']} · {money(row['total'])}{comment}")
+    return "\n".join(lines)
+
+
 def daily_totals(chat_id, start, end):
     with db() as connection:
         return connection.execute(
@@ -1679,6 +1741,8 @@ def help_text():
         "/report 01.09 15.09 — отчет за период\n"
         "/category Еда — где больше всего тратишь в категории\n"
         "/category Еда 09.2026 — категория за другой месяц\n"
+        "/place Пилад — траты в месте за месяц и всё время\n"
+        "/place Библио вендинг 09.2026 — место за другой месяц\n"
         "/history — последние покупки и комментарии\n"
         "/limits — лимиты категорий\n"
         "/limit Еда 20000 — задать лимит\n"
@@ -1744,6 +1808,23 @@ def handle_message(message):
             send(chat_id, str(error))
             return
         send(chat_id, category_report_text(chat_id, pieces[1], month))
+        return
+    if text == "/place" or text.startswith("/place "):
+        name = text[len("/place"):].strip()
+        if not name:
+            send(chat_id, "Напиши /place Пилад или /place Библио вендинг 09.2026")
+            return
+        calendar_today = user_calendar_today(user)
+        month = calendar_today.replace(day=1)
+        parts = name.rsplit(maxsplit=1)
+        if len(parts) == 2 and re.fullmatch(r"\d{1,2}\.\d{4}", parts[1]):
+            try:
+                month = parse_report_month(parts[1], calendar_today)
+            except ValueError as error:
+                send(chat_id, str(error))
+                return
+            name = parts[0]
+        send(chat_id, place_report_text(chat_id, name, month))
         return
     if text.startswith("/budget"):
         pieces = text.split()
