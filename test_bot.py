@@ -1,3 +1,5 @@
+import base64
+import json
 import os
 import tempfile
 import unittest
@@ -566,6 +568,39 @@ class StorageTest(unittest.TestCase):
         self.assertEqual([row["place"] for row in places], ["Пилад"])
         report = bot.category_report_text(1, "Продукты", date(2026, 10, 1))
         self.assertIn("Пилад: 150 ₽ (100%, покупок: 2)", report)
+
+    def test_verified_csv_corrections_update_existing_rows_once(self):
+        bot.ensure_user(563057258)
+        day = date(2026, 10, 5)
+        for index in range(19):
+            bot.save_expenses(563057258, [("Еда", f"покупка {index}", 10000)], day)
+        with bot.db() as connection:
+            source = connection.execute(
+                """SELECT id, spent_on, category, place, comment, amount_cents, batch_id, created_at
+                   FROM expenses WHERE chat_id = ? ORDER BY id""",
+                (563057258,),
+            ).fetchall()
+        patch_rows = [
+            {
+                "id": row["id"], "before_sha256": bot.expense_correction_fingerprint(row),
+                "place": "ПИЛАД", "comment": row["comment"],
+            }
+            for row in source
+        ]
+        encoded = base64.b64encode(json.dumps({
+            "chat_id": 563057258, "rows": patch_rows,
+        }).encode()).decode()
+        with tempfile.TemporaryDirectory() as directory:
+            backup = os.path.join(directory, "expenses-before-csv-corrections.db")
+            self.assertEqual(bot.apply_expense_corrections(encoded, backup), 19)
+            self.assertTrue(os.path.getsize(backup) > 0)
+            self.assertEqual(bot.apply_expense_corrections(encoded, backup), 0)
+        with bot.db() as connection:
+            result = connection.execute(
+                "SELECT COUNT(*) AS count, SUM(amount_cents) AS total FROM expenses WHERE chat_id = ? AND place = ?",
+                (563057258, "Пилад"),
+            ).fetchone()
+        self.assertEqual((result["count"], result["total"]), (19, 190000))
 
     def test_monthly_allocation_keeps_place_and_counts_as_one_purchase(self):
         bot.ensure_user(1)
