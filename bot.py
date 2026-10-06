@@ -1379,15 +1379,12 @@ def budget_snapshot(user, today):
     month_start = today.replace(day=1)
     days_in_month = calendar.monthrange(today.year, today.month)[1]
     month_end = today.replace(day=days_in_month)
-    week_start = today - timedelta(days=today.weekday())
-    week_end = min(week_start + timedelta(days=6), month_end)
+    week_end = min(today + timedelta(days=6 - today.weekday()), month_end)
     month_spent = spent(user["chat_id"], month_start, today)
-    week_spent = spent(user["chat_id"], week_start, today)
     remaining = max(user["budget_cents"] - month_spent, 0)
     days_left = max((month_end - today).days + 1, 1)
     daily = remaining // days_left
-    week_allowance = user["budget_cents"] * ((week_end - week_start).days + 1) // days_in_month
-    week_left = max(week_allowance - week_spent, 0)
+    week_left = daily * ((week_end - today).days + 1)
     return daily, week_left, remaining
 
 

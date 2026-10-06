@@ -581,6 +581,40 @@ class StorageTest(unittest.TestCase):
         self.assertEqual(send_mock.call_count, 2)
         self.assertIn("На сегодня:", send_mock.call_args.args[1])
 
+    def test_week_budget_uses_same_daily_rate_as_month_remaining(self):
+        bot.ensure_user(1)
+        with bot.db() as connection:
+            connection.execute("UPDATE users SET budget_cents = ? WHERE chat_id = 1", (2000000,))
+        bot.save_expenses(1, [("Еда", "", 120200)], date(2026, 10, 5))
+        user = bot.get_user(1)
+
+        self.assertEqual(bot.budget_snapshot(user, date(2026, 10, 6)), (72300, 433800, 1879800))
+        message = bot.morning_text(user, date(2026, 10, 6))
+        self.assertIn("На сегодня: 723 ₽", message)
+        self.assertIn("На неделю осталось: 4 338 ₽", message)
+        self.assertIn("До конца месяца: 18 798 ₽", message)
+        self.assertEqual(bot.budget_snapshot(user, date(2026, 10, 9))[1], 3 * bot.budget_snapshot(user, date(2026, 10, 9))[0])
+
+    def test_week_budget_stops_at_month_end_and_recalculates_daily(self):
+        bot.ensure_user(1)
+        with bot.db() as connection:
+            connection.execute("UPDATE users SET budget_cents = ? WHERE chat_id = 1", (310000,))
+        user = bot.get_user(1)
+        self.assertEqual(bot.budget_snapshot(user, date(2026, 10, 30)), (155000, 310000, 310000))
+        self.assertEqual(bot.budget_snapshot(user, date(2026, 10, 31)), (310000, 310000, 310000))
+
+    def test_daily_rounding_reaches_exact_month_budget_on_last_day(self):
+        bot.ensure_user(1)
+        with bot.db() as connection:
+            connection.execute("UPDATE users SET budget_cents = ? WHERE chat_id = 1", (1001,))
+        user = bot.get_user(1)
+        first_day = bot.budget_snapshot(user, date(2026, 10, 29))[0]
+        bot.save_expenses(1, [("Еда", "", first_day)], date(2026, 10, 29))
+        second_day = bot.budget_snapshot(user, date(2026, 10, 30))[0]
+        bot.save_expenses(1, [("Еда", "", second_day)], date(2026, 10, 30))
+        last_day = bot.budget_snapshot(user, date(2026, 10, 31))[0]
+        self.assertEqual(first_day + second_day + last_day, 1001)
+
     def test_existing_users_table_gets_salary_column(self):
         with bot.db() as connection:
             connection.execute("DROP TABLE users")
