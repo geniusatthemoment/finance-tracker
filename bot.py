@@ -56,6 +56,21 @@ DATE_PREFIX_RE = re.compile(rf"^({DATE_TEXT})\s*(?::|-)?\s+(.+)$")
 DATE_SUFFIX_RE = re.compile(rf"^(.+?)\s+({DATE_TEXT})$")
 MONTHLY_RE = re.compile(r"\s+ЕЖЕМЕСЯЧНО\s*$", re.IGNORECASE)
 
+DEFAULT_PLACE_ALIASES = {
+    "кфс": "Ростикс", "kfc": "Ростикс", "ростик": "Ростикс", "rostics": "Ростикс",
+    "макдак": "Вкусно-и-точка", "мак": "Вкусно-и-точка",
+    "макдональдс": "Вкусно-и-точка", "mcdonalds": "Вкусно-и-точка",
+    "вкусноточка": "Вкусно-и-точка",
+    "библио": "Библио вендинг", "библиовендинг": "Библио вендинг",
+    "biblio": "Библио вендинг",
+    "пятерочка": "Пятёрочка", "пятерка": "Пятёрочка",
+    "пятёрка": "Пятёрочка", "5ка": "Пятёрочка",
+    "йоки": "Йоки-токи", "йокитоки": "Йоки-токи", "yoki": "Йоки-токи",
+    "ярче!": "Ярче", "yarche": "Ярче", "нашгастроном": "Наш гастроном",
+    "ozon": "Озон", "lenta": "Лента", "pilad": "Пилад",
+    "azalia": "Азалия", "lampa": "Лампа",
+}
+
 
 def db():
     connection = sqlite3.connect(DB_PATH)
@@ -131,6 +146,17 @@ def init_db():
                 place TEXT NOT NULL DEFAULT '',
                 comment TEXT NOT NULL DEFAULT '',
                 amount_cents INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS place_aliases (
+                chat_id INTEGER NOT NULL,
+                alias TEXT NOT NULL,
+                canonical TEXT NOT NULL,
+                PRIMARY KEY (chat_id, alias)
+            );
+
+            CREATE TABLE IF NOT EXISTS place_alias_defaults_initialized (
+                chat_id INTEGER PRIMARY KEY
             );
 
             CREATE TABLE IF NOT EXISTS pending_actions (
@@ -474,6 +500,19 @@ def ensure_user(chat_id):
             "INSERT OR IGNORE INTO users(chat_id, timezone, created_at, morning_hour) VALUES (?, ?, ?, ?)",
             (chat_id, DEFAULT_TIMEZONE, datetime.utcnow().isoformat(), MORNING_HOUR),
         )
+        if not connection.execute(
+            "SELECT 1 FROM place_alias_defaults_initialized WHERE chat_id = ?", (chat_id,)
+        ).fetchone():
+            connection.executemany(
+                "INSERT OR IGNORE INTO place_aliases(chat_id, alias, canonical) VALUES (?, ?, ?)",
+                [
+                    (chat_id, normalize_place(alias), normalize_place(canonical))
+                    for alias, canonical in DEFAULT_PLACE_ALIASES.items()
+                ],
+            )
+            connection.execute(
+                "INSERT INTO place_alias_defaults_initialized(chat_id) VALUES (?)", (chat_id,)
+            )
 
 
 def is_allowed(update_part):
@@ -487,6 +526,66 @@ def normalize_category(category):
 
 def normalize_place(place):
     return " ".join(place.split()).casefold().capitalize()
+
+
+def place_aliases(chat_id):
+    with db() as connection:
+        rows = connection.execute(
+            "SELECT alias, canonical FROM place_aliases WHERE chat_id = ?", (chat_id,)
+        ).fetchall()
+    return {row["alias"]: row["canonical"] for row in rows}
+
+
+def resolve_place(chat_id, place, aliases=None):
+    current = normalize_place(place)
+    if not current:
+        return ""
+    aliases = place_aliases(chat_id) if aliases is None else aliases
+    seen = set()
+    while current in aliases:
+        if current in seen:
+            raise ValueError("Обнаружен цикл в псевдонимах мест")
+        seen.add(current)
+        current = aliases[current]
+    return current
+
+
+def set_place_alias(chat_id, alias, canonical):
+    alias = normalize_place(alias)
+    canonical = normalize_place(canonical)
+    if not alias or not canonical or len(alias) > 60 or len(canonical) > 60:
+        raise ValueError("Название места должно содержать от 1 до 60 символов")
+    aliases = place_aliases(chat_id)
+    target = resolve_place(chat_id, canonical, aliases)
+    if alias == target:
+        raise ValueError("Место не может быть псевдонимом самого себя")
+    aliases[alias] = target
+    resolve_place(chat_id, alias, aliases)  # Reject cycles before writing.
+    with db() as connection:
+        connection.execute(
+            """INSERT INTO place_aliases(chat_id, alias, canonical) VALUES (?, ?, ?)
+               ON CONFLICT(chat_id, alias) DO UPDATE SET canonical = excluded.canonical""",
+            (chat_id, alias, target),
+        )
+    return alias, target
+
+
+def delete_place_alias(chat_id, alias):
+    with db() as connection:
+        return bool(connection.execute(
+            "DELETE FROM place_aliases WHERE chat_id = ? AND alias = ?",
+            (chat_id, normalize_place(alias)),
+        ).rowcount)
+
+
+def place_aliases_text(chat_id):
+    aliases = place_aliases(chat_id)
+    if not aliases:
+        return "Псевдонимов мест нет. Добавь: /alias кфс = Ростикс"
+    lines = ["Псевдонимы мест:"]
+    lines.extend(f"• {alias} → {canonical}" for alias, canonical in sorted(aliases.items()))
+    lines.append("\nДобавить: /alias мак = Вкусно-и-точка\nУдалить: /alias_delete мак")
+    return "\n".join(lines)
 
 
 def business_day(local_now, cutoff_hour=4):
@@ -695,7 +794,7 @@ def category_report_text(chat_id, category, month_start):
         day=calendar.monthrange(month_start.year, month_start.month)[1]
     )
     with db() as connection:
-        places = connection.execute(
+        raw_places = connection.execute(
             """
             SELECT place, SUM(amount_cents) AS total,
                    COUNT(DISTINCT CASE WHEN amount_cents > 0 THEN
@@ -720,6 +819,14 @@ def category_report_text(chat_id, category, month_start):
             """,
             (chat_id, category, month_start.isoformat(), month_end.isoformat()),
         ).fetchall()
+    aliases = place_aliases(chat_id)
+    grouped = {}
+    for row in raw_places:
+        place = resolve_place(chat_id, row["place"], aliases)
+        result = grouped.setdefault(place, {"place": place, "total": 0, "purchases": 0})
+        result["total"] += row["total"]
+        result["purchases"] += row["purchases"]
+    places = sorted(grouped.values(), key=lambda row: (-row["total"], row["place"]))
     if not places:
         return f"За {month_start:%m.%Y} трат в категории «{category}» нет."
     total = sum(row["total"] for row in places)
@@ -743,28 +850,35 @@ def category_report_text(chat_id, category, month_start):
     lines.extend(["", "Последние покупки:"])
     for row in recent:
         day = date.fromisoformat(row["first_day"])
-        place = row["place"] or "Без места"
+        place = resolve_place(chat_id, row["place"], aliases) or "Без места"
         comment = f" · {row['comment'][:80]}" if row["comment"] else ""
         lines.append(f"• {day:%d.%m} · {place} · {money(row['total'])}{comment}")
     return "\n".join(lines)
 
 
 def place_report_text(chat_id, place, month_start):
-    place = normalize_place(place)
+    aliases = place_aliases(chat_id)
+    place = resolve_place(chat_id, place, aliases)
+    variants = sorted(
+        {place} | {
+            alias for alias in aliases if resolve_place(chat_id, alias, aliases) == place
+        }
+    )
+    placeholders = ",".join("?" for _ in variants)
     month_end = month_start.replace(
         day=calendar.monthrange(month_start.year, month_start.month)[1]
     )
     with db() as connection:
         def breakdown(start=None, end=None):
             period_filter = "AND spent_on BETWEEN ? AND ?" if start else ""
-            params = (chat_id, place, start.isoformat(), end.isoformat()) if start else (chat_id, place)
+            params = (chat_id, *variants, start.isoformat(), end.isoformat()) if start else (chat_id, *variants)
             return connection.execute(
                 f"""SELECT category, SUM(amount_cents) AS total,
                            COUNT(DISTINCT CASE WHEN amount_cents > 0 THEN
                                CASE WHEN batch_id IS NULL THEN 'expense:' || id
                                     ELSE 'batch:' || batch_id END
                            END) AS purchases
-                    FROM expenses WHERE chat_id = ? AND place = ? {period_filter}
+                    FROM expenses WHERE chat_id = ? AND place IN ({placeholders}) {period_filter}
                     GROUP BY category ORDER BY total DESC, category""",
                 params,
             ).fetchall()
@@ -772,14 +886,14 @@ def place_report_text(chat_id, place, month_start):
         monthly = breakdown(month_start, month_end)
         all_time = breakdown()
         recent = connection.execute(
-            """SELECT category, comment, SUM(amount_cents) AS total,
+            f"""SELECT category, comment, SUM(amount_cents) AS total,
                       MIN(spent_on) AS first_day, MAX(spent_on) AS last_day
-               FROM expenses WHERE chat_id = ? AND place = ?
+               FROM expenses WHERE chat_id = ? AND place IN ({placeholders})
                  AND spent_on BETWEEN ? AND ?
                GROUP BY CASE WHEN batch_id IS NULL THEN 'expense:' || id
                              ELSE 'batch:' || batch_id END
                ORDER BY MAX(spent_on) DESC, MAX(id) DESC LIMIT 10""",
-            (chat_id, place, month_start.isoformat(), month_end.isoformat()),
+            (chat_id, *variants, month_start.isoformat(), month_end.isoformat()),
         ).fetchall()
     if not all_time:
         return f"Трат в месте «{place}» пока нет."
@@ -868,6 +982,7 @@ def expense_details(chat_id, expense_id):
                 "id": row["id"],
                 "category": row["category"],
                 "place": row["place"],
+                "display_place": resolve_place(chat_id, row["place"]),
                 "comment": row["comment"],
                 "total": row["amount_cents"],
                 "start_day": row["spent_on"],
@@ -886,6 +1001,7 @@ def expense_details(chat_id, expense_id):
             "id": row["id"],
             "category": row["category"],
             "place": row["place"],
+            "display_place": resolve_place(chat_id, row["place"]),
             "comment": row["comment"],
             "total": summary["total"],
             "start_day": summary["start_day"],
@@ -906,7 +1022,7 @@ def expense_details_text(details):
         f"Покупка #{details['id']}\n"
         f"{when}\n"
         f"Категория: {details['category']}\n"
-        f"Место: {details['place'] or '—'}\n"
+        f"Место: {details.get('display_place', details['place']) or '—'}\n"
         f"Комментарий: {comment}\n"
         f"Сумма: {money(details['total'])}"
     )
@@ -919,7 +1035,7 @@ def history_message(chat_id):
     buttons = []
     for row in rows:
         start_day = date.fromisoformat(row["start_day"])
-        place = f" · {row['place']}" if row["place"] else ""
+        place = f" · {resolve_place(chat_id, row['place'])}" if row["place"] else ""
         label = f"{start_day:%d.%m} · {row['category']}{place} · {money(row['total'])}"
         buttons.append(
             [{"text": label, "callback_data": f"expense:{row['id']}"}]
@@ -1320,7 +1436,7 @@ def recurring_message(chat_id):
     lines = ["Регулярные платежи:"]
     buttons = []
     for row in rows:
-        place = f" · {row['place']}" if row["place"] else ""
+        place = f" · {resolve_place(chat_id, row['place'])}" if row["place"] else ""
         comment = f" — {row['comment']}" if row["comment"] else ""
         lines.append(
             f"• {row['day_of_month']}-го: {row['category']}{place}{comment}, {money(row['amount_cents'])}"
@@ -1396,7 +1512,7 @@ def favorites_message(chat_id):
     for row in rows:
         title = row["category"]
         if row["place"]:
-            title += f" · {row['place']}"
+            title += f" · {resolve_place(chat_id, row['place'])}"
         if row["comment"]:
             title += f" · {row['comment']}"
         buttons.append(
@@ -1426,9 +1542,14 @@ def search_expenses(chat_id, query, limit=20):
             (chat_id,),
         ).fetchall()
     needle = query.casefold()
+    aliases = place_aliases(chat_id)
+    canonical_needle = resolve_place(chat_id, query, aliases).casefold()
     return [
         row for row in rows
-        if needle in row["comment"].casefold() or needle in row["place"].casefold()
+        if needle in row["comment"].casefold()
+        or needle in row["place"].casefold()
+        or needle in resolve_place(chat_id, row["place"], aliases).casefold()
+        or (query.strip() and canonical_needle == resolve_place(chat_id, row["place"], aliases).casefold())
     ][:limit]
 
 
@@ -1439,7 +1560,7 @@ def search_message(chat_id, query):
     buttons = []
     for row in rows:
         day = date.fromisoformat(row["start_day"])
-        place = f" · {row['place']}" if row["place"] else ""
+        place = f" · {resolve_place(chat_id, row['place'])}" if row["place"] else ""
         buttons.append(
             [
                 {
@@ -1743,6 +1864,8 @@ def help_text():
         "/category Еда 09.2026 — категория за другой месяц\n"
         "/place Пилад — траты в месте за месяц и всё время\n"
         "/place Библио вендинг 09.2026 — место за другой месяц\n"
+        "/alias мак = Вкусно-и-точка — добавить псевдоним места\n"
+        "/aliases — список; /alias_delete мак — удалить\n"
         "/history — последние покупки и комментарии\n"
         "/limits — лимиты категорий\n"
         "/limit Еда 20000 — задать лимит\n"
@@ -1825,6 +1948,30 @@ def handle_message(message):
                 return
             name = parts[0]
         send(chat_id, place_report_text(chat_id, name, month))
+        return
+    if text == "/aliases":
+        send(chat_id, place_aliases_text(chat_id))
+        return
+    if text == "/alias" or text.startswith("/alias "):
+        parts = text[len("/alias"):].split("=", 1)
+        if len(parts) != 2:
+            send(chat_id, "Добавь псевдоним так: /alias мак = Вкусно-и-точка")
+            return
+        try:
+            alias, canonical = set_place_alias(chat_id, parts[0], parts[1])
+        except ValueError as error:
+            send(chat_id, str(error))
+            return
+        send(chat_id, f"Псевдоним сохранён: {alias} → {canonical}. Старые траты тоже учитываются вместе.")
+        return
+    if text == "/alias_delete" or text.startswith("/alias_delete "):
+        alias = text[len("/alias_delete"):].strip()
+        if not alias:
+            send(chat_id, "Удалить псевдоним: /alias_delete мак")
+        elif delete_place_alias(chat_id, alias):
+            send(chat_id, f"Псевдоним «{normalize_place(alias)}» удалён. Старые названия снова разделены в отчётах.")
+        else:
+            send(chat_id, f"Псевдоним «{normalize_place(alias)}» не найден.")
         return
     if text.startswith("/budget"):
         pieces = text.split()
@@ -2218,6 +2365,7 @@ def handle_message(message):
             send(chat_id, "Покупка уже не найдена.")
             return
         category, place, comment, cents, spent_on, monthly = replacement
+        place = resolve_place(chat_id, place)
         suffix = " ЕЖЕМЕСЯЧНО" if monthly else ""
         send(
             chat_id,
@@ -2249,7 +2397,7 @@ def handle_message(message):
         dated_items = by_date[spent_on]
         save_expenses(chat_id, dated_items, spent_on)
         saved = ", ".join(
-            f"{category}{f' · {place}' if place else ''} — {money(cents)}"
+            f"{category}{f' · {resolve_place(chat_id, place)}' if place else ''} — {money(cents)}"
             + (f" ({comment})" if comment else "")
             for category, place, comment, cents in dated_items
         )
@@ -2275,8 +2423,9 @@ def handle_message(message):
             place=place,
         )
         month_label = spent_on.strftime("%m.%Y")
+        display_place = resolve_place(chat_id, place)
         response.append(
-            f"Распределил за {month_label}: {category}{f' · {place}' if place else ''} — {money(cents)}\n"
+            f"Распределил за {month_label}: {category}{f' · {display_place}' if display_place else ''} — {money(cents)}\n"
             f"На {days_in_month} дней: примерно {money(daily_cents)} в день"
         )
         warning = category_limit_warning(chat_id, category, spent_on)
@@ -2483,7 +2632,7 @@ def handle_callback(callback):
             today,
         )
         api("answerCallbackQuery", callback_query_id=callback["id"], text="Записал")
-        place = f" · {favorite['place']}" if favorite["place"] else ""
+        place = f" · {resolve_place(chat_id, favorite['place'])}" if favorite["place"] else ""
         message = f"Записал: {favorite['category']}{place} — {money(favorite['amount_cents'])}"
         warning = category_limit_warning(chat_id, favorite["category"], today)
         if warning:

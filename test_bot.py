@@ -606,6 +606,52 @@ class StorageTest(unittest.TestCase):
         self.assertIn("Трат в месте «Нет» пока нет.", self.send_command(1, "/place нет"))
         self.assertIn("Напиши /place", self.send_command(1, "/place"))
 
+    def test_default_place_aliases_are_per_user_and_deletion_persists(self):
+        bot.ensure_user(1)
+        bot.ensure_user(2)
+        self.assertEqual(bot.resolve_place(1, "МАК"), "Вкусно-и-точка")
+        self.assertEqual(bot.resolve_place(1, "кфс"), "Ростикс")
+        self.assertIn("Мак → Вкусно-и-точка", self.send_command(1, "/aliases"))
+        self.assertIn("удалён", self.send_command(1, "/alias_delete мак"))
+        bot.ensure_user(1)
+        self.assertEqual(bot.resolve_place(1, "мак"), "Мак")
+        self.assertEqual(bot.resolve_place(2, "мак"), "Вкусно-и-точка")
+
+    def test_aliases_group_old_expenses_without_rewriting_them(self):
+        bot.ensure_user(1)
+        day = date(2026, 10, 5)
+        bot.save_expenses(1, [("Еда", "Кфс", "обед", 10000)], day)
+        bot.save_expenses(1, [("Еда", "Ростикс", "ужин", 20000)], day)
+        report = bot.category_report_text(1, "Еда", date(2026, 10, 1))
+        self.assertIn("Ростикс: 300 ₽ (100%, покупок: 2)", report)
+        self.assertNotIn("Кфс:", report)
+        place = bot.place_report_text(1, "кфс", date(2026, 10, 1))
+        self.assertIn("Место «Ростикс»", place)
+        self.assertIn("Потрачено: 300 ₽\nПокупок: 2", place)
+        self.assertEqual(len(bot.search_expenses(1, "ростикс")), 2)
+        self.assertEqual(len(bot.search_expenses(1, "кфс")), 2)
+        self.assertIn("Ростикс", str(bot.history_message(1)))
+        self.assertIn("Место: Ростикс", bot.expense_details_text(bot.expense_details(1, bot.recent_expenses(1)[1]["id"])))
+        exported = bot.export_csv(1).decode("utf-8-sig")
+        self.assertIn("Кфс", exported)
+        self.assertIn("Ростикс", exported)
+        bot.delete_place_alias(1, "кфс")
+        report = bot.category_report_text(1, "Еда", date(2026, 10, 1))
+        self.assertIn("Кфс: 100 ₽", report)
+        self.assertIn("Ростикс: 200 ₽", report)
+
+    def test_custom_alias_command_supports_updates_multiword_places_and_no_cycles(self):
+        bot.ensure_user(1)
+        bot.ensure_user(2)
+        self.assertIn("Библио → Библио вендинг", self.send_command(1, "/alias Библио = Библио вендинг"))
+        self.assertIn("Бабка → Лента", self.send_command(1, "/alias Бабка = Лента"))
+        self.assertEqual(bot.resolve_place(1, "бабка"), "Лента")
+        self.assertEqual(bot.resolve_place(2, "бабка"), "Бабка")
+        bot.save_expenses(1, [("Продукты", "Бабка", "молоко", 5000)], date(2026, 10, 5))
+        self.assertIn("Потрачено: 50 ₽", bot.place_report_text(1, "Лента", date(2026, 10, 1)))
+        self.assertIn("самого себя", self.send_command(1, "/alias Лента = Бабка"))
+        self.assertIn("Добавь псевдоним", self.send_command(1, "/alias неверно"))
+
     def test_monthly_allocation_keeps_place_and_counts_as_one_purchase(self):
         bot.ensure_user(1)
         bot.save_monthly_expense(
