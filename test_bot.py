@@ -546,6 +546,27 @@ class StorageTest(unittest.TestCase):
         self.assertNotIn("7 000 ₽", report)
         self.assertIn("Всего: 9 000 ₽", september)
 
+    def test_existing_places_with_different_case_merge_on_startup(self):
+        bot.ensure_user(1)
+        day = date(2026, 10, 5)
+        bot.save_expenses(1, [("Продукты", "Пилад", "семечки", 10000)], day)
+        bot.save_expenses(1, [("Продукты", "пилад", "вода", 5000)], day)
+        with bot.db() as connection:
+            connection.execute(
+                "UPDATE expenses SET place = 'ПИЛАД' WHERE chat_id = 1 AND comment = 'семечки'"
+            )
+            connection.execute(
+                "UPDATE expenses SET place = 'пилад' WHERE chat_id = 1 AND comment = 'вода'"
+            )
+        bot.init_db()
+        with bot.db() as connection:
+            places = connection.execute(
+                "SELECT DISTINCT place FROM expenses WHERE chat_id = 1"
+            ).fetchall()
+        self.assertEqual([row["place"] for row in places], ["Пилад"])
+        report = bot.category_report_text(1, "Продукты", date(2026, 10, 1))
+        self.assertIn("Пилад: 150 ₽ (100%, покупок: 2)", report)
+
     def test_monthly_allocation_keeps_place_and_counts_as_one_purchase(self):
         bot.ensure_user(1)
         bot.save_monthly_expense(

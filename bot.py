@@ -236,11 +236,20 @@ def init_db():
                 connection.execute(
                     f"ALTER TABLE {table} ADD COLUMN place TEXT NOT NULL DEFAULT ''"
                 )
-        rows = connection.execute("SELECT id, category FROM expenses").fetchall()
+        rows = connection.execute("SELECT id, category, place FROM expenses").fetchall()
         connection.executemany(
-            "UPDATE expenses SET category = ? WHERE id = ?",
-            [(normalize_category(row["category"]), row["id"]) for row in rows],
+            "UPDATE expenses SET category = ?, place = ? WHERE id = ?",
+            [
+                (normalize_category(row["category"]), normalize_place(row["place"]), row["id"])
+                for row in rows
+            ],
         )
+        for table in ("recurring_expenses", "favorites"):
+            rows = connection.execute(f"SELECT id, place FROM {table}").fetchall()
+            connection.executemany(
+                f"UPDATE {table} SET place = ? WHERE id = ?",
+                [(normalize_place(row["place"]), row["id"]) for row in rows],
+            )
         migration = "563057258_transport_small_fares_to_bus_2026_09_30"
         if not connection.execute(
             "SELECT 1 FROM data_migrations WHERE name = ?", (migration,)
