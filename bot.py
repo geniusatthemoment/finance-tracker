@@ -2,7 +2,6 @@
 """A deliberately small Telegram expense tracker with no AI or dependencies."""
 
 import calendar
-import base64
 import csv
 import hashlib
 import io
@@ -62,68 +61,6 @@ def db():
     connection = sqlite3.connect(DB_PATH)
     connection.row_factory = sqlite3.Row
     return connection
-
-
-def expense_correction_fingerprint(row):
-    fields = [
-        row["id"], row["spent_on"], row["category"], row["place"], row["comment"],
-        row["amount_cents"], row["batch_id"] or "", row["created_at"],
-    ]
-    encoded = json.dumps(fields, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def apply_expense_corrections(encoded_patch, backup_path):
-    """Apply a verified one-off place/comment patch without importing duplicate expenses."""
-    patch = json.loads(base64.b64decode(encoded_patch, validate=True))
-    if patch.get("chat_id") != 563057258 or not isinstance(patch.get("rows"), list):
-        raise ValueError("Invalid expense correction target")
-    rows = patch["rows"]
-    if len(rows) != 19 or len({item["id"] for item in rows}) != len(rows):
-        raise ValueError("Unexpected expense correction rows")
-    migration = "expense_places_2026_10_06_" + hashlib.sha256(encoded_patch.encode()).hexdigest()[:12]
-    with db() as connection:
-        if connection.execute(
-            "SELECT 1 FROM data_migrations WHERE name = ?", (migration,)
-        ).fetchone():
-            return 0
-        for item in rows:
-            if (
-                type(item.get("id")) is not int
-                or not isinstance(item.get("before_sha256"), str)
-                or not isinstance(item.get("place"), str)
-                or not isinstance(item.get("comment"), str)
-            ):
-                raise ValueError("Invalid expense correction row")
-            current = connection.execute(
-                """SELECT id, spent_on, category, place, comment, amount_cents, batch_id, created_at
-                   FROM expenses WHERE chat_id = ? AND id = ?""",
-                (patch["chat_id"], item["id"]),
-            ).fetchone()
-            if current is None or expense_correction_fingerprint(current) != item["before_sha256"]:
-                raise ValueError(f"Expense {item['id']} differs from the CSV export; no changes made")
-        if not os.path.exists(backup_path):
-            with sqlite3.connect(backup_path) as backup:
-                connection.backup(backup)
-        connection.execute("BEGIN IMMEDIATE")
-        for item in rows:
-            current = connection.execute(
-                """SELECT id, spent_on, category, place, comment, amount_cents, batch_id, created_at
-                   FROM expenses WHERE chat_id = ? AND id = ?""",
-                (patch["chat_id"], item["id"]),
-            ).fetchone()
-            if current is None or expense_correction_fingerprint(current) != item["before_sha256"]:
-                raise ValueError(f"Expense {item['id']} changed during backup; no changes made")
-        for item in rows:
-            connection.execute(
-                "UPDATE expenses SET place = ?, comment = ? WHERE chat_id = ? AND id = ?",
-                (normalize_place(item["place"]), item["comment"], patch["chat_id"], item["id"]),
-            )
-        connection.execute(
-            "INSERT INTO data_migrations(name, applied_at, affected_rows) VALUES (?, ?, ?)",
-            (migration, datetime.utcnow().isoformat(), len(rows)),
-        )
-    return len(rows)
 
 
 def init_db():
@@ -2614,12 +2551,6 @@ def main():
         raise SystemExit(1)
     ZoneInfo(DEFAULT_TIMEZONE)  # fail early on a typo
     init_db()
-    encoded_patch = os.environ.get("EXPENSE_CORRECTIONS_B64", "")
-    if encoded_patch:
-        count = apply_expense_corrections(
-            encoded_patch, os.path.join(os.path.dirname(DB_PATH), "expenses-before-csv-corrections.db")
-        )
-        print(f"Verified CSV corrections applied: {count} expense(s)", flush=True)
     print("Bot is running. Press Ctrl+C to stop.")
     offset = 0
     while True:
