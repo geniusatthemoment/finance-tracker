@@ -43,7 +43,7 @@ ALLOWED_USER_IDS = parse_allowed_user_ids(
 )
 DB_PATH = os.environ.get("DATABASE_PATH", "expenses.db")
 DEFAULT_TIMEZONE = os.environ.get("BOT_TIMEZONE", "Asia/Tomsk")
-MORNING_HOUR = int(os.environ.get("MORNING_HOUR", "9"))
+MORNING_HOUR = int(os.environ.get("MORNING_HOUR", "10"))
 MONTHLY_REPORT_START = date(2026, 10, 1)
 API_URL = "https://api.telegram.org/bot{}/{}"
 
@@ -195,6 +195,17 @@ def init_db():
         ):
             if name not in user_columns:
                 connection.execute(f"ALTER TABLE users ADD COLUMN {name} {declaration}")
+        migration = "morning_budget_at_10_2026_10_06"
+        if not connection.execute(
+            "SELECT 1 FROM data_migrations WHERE name = ?", (migration,)
+        ).fetchone():
+            updated = connection.execute(
+                "UPDATE users SET morning_hour = 10 WHERE morning_hour = 9"
+            ).rowcount
+            connection.execute(
+                "INSERT INTO data_migrations(name, applied_at, affected_rows) VALUES (?, ?, ?)",
+                (migration, datetime.utcnow().isoformat(), updated),
+            )
         connection.execute(
             """INSERT OR IGNORE INTO salary_history(chat_id, effective_from, salary_cents)
                SELECT chat_id, '0001-01-01', salary_cents FROM users
@@ -436,8 +447,8 @@ def monthly_balance(chat_id, today):
 def ensure_user(chat_id):
     with db() as connection:
         connection.execute(
-            "INSERT OR IGNORE INTO users(chat_id, timezone, created_at) VALUES (?, ?, ?)",
-            (chat_id, DEFAULT_TIMEZONE, datetime.utcnow().isoformat()),
+            "INSERT OR IGNORE INTO users(chat_id, timezone, created_at, morning_hour) VALUES (?, ?, ?, ?)",
+            (chat_id, DEFAULT_TIMEZONE, datetime.utcnow().isoformat(), MORNING_HOUR),
         )
 
 
@@ -1778,7 +1789,7 @@ def handle_message(message):
         send(chat_id, f"Запланировал на {planned_on:%d.%m.%Y}: {match.group(2)} — {money(cents)}")
         return
     if text == "/settings":
-        send(chat_id, f"Часовой пояс: {user['timezone']}\nДень заканчивается в {user['day_cutoff_hour']:02d}:00\nНапоминания: {user['reminder_hours']}\nБюджет: {user['morning_hour']:02d}:00; прибыль: {user['profit_hour']:02d}:00\nИзменить: /settings cutoff 4, /settings reminders 20 22 0, /settings morning 9, /settings profit 10, /settings timezone Asia/Tomsk")
+        send(chat_id, f"Часовой пояс: {user['timezone']}\nДень заканчивается в {user['day_cutoff_hour']:02d}:00\nНапоминания: {user['reminder_hours']}\nБюджет: {user['morning_hour']:02d}:00; прибыль: {user['profit_hour']:02d}:00\nИзменить: /settings cutoff 4, /settings reminders 20 22 0, /settings morning 10, /settings profit 10, /settings timezone Asia/Tomsk")
         return
     if text.startswith("/settings "):
         parts = text.split()

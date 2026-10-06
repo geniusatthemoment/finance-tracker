@@ -581,6 +581,52 @@ class StorageTest(unittest.TestCase):
         self.assertEqual(send_mock.call_count, 2)
         self.assertIn("На сегодня:", send_mock.call_args.args[1])
 
+    def test_ten_am_morning_budget_is_separate_from_profit_and_status(self):
+        bot.ensure_user(1)
+        with bot.db() as connection:
+            connection.execute(
+                "UPDATE users SET budget_cents = ?, salary_cents = ? WHERE chat_id = 1",
+                (2000000, 3100000),
+            )
+
+        class FrozenDateTime(datetime):
+            current = datetime(2026, 10, 6, 9, 0, tzinfo=ZoneInfo("Asia/Tomsk"))
+
+            @classmethod
+            def now(cls, tz=None):
+                return cls.current.astimezone(tz)
+
+        with patch.object(bot, "datetime", FrozenDateTime), patch.object(
+            bot, "send", return_value={"message_id": 1}
+        ) as sender:
+            bot.run_schedule()
+            sender.assert_not_called()
+            FrozenDateTime.current = datetime(2026, 10, 6, 10, 0, tzinfo=ZoneInfo("Asia/Tomsk"))
+            bot.run_schedule()
+            bot.run_schedule()
+        messages = [call.args[1] for call in sender.call_args_list]
+        self.assertEqual(len(messages), 2)
+        self.assertTrue(messages[0].startswith("Доброе утро!"))
+        self.assertIn("На неделю осталось:", messages[0])
+        self.assertIn("Итог за 05.10.2026", messages[1])
+
+    def test_existing_default_morning_hour_moves_to_ten_once(self):
+        bot.ensure_user(1)
+        bot.ensure_user(2)
+        with bot.db() as connection:
+            connection.execute("UPDATE users SET morning_hour = 9 WHERE chat_id = 1")
+            connection.execute("UPDATE users SET morning_hour = 11 WHERE chat_id = 2")
+            connection.execute(
+                "DELETE FROM data_migrations WHERE name = 'morning_budget_at_10_2026_10_06'"
+            )
+        bot.init_db()
+        self.assertEqual(bot.get_user(1)["morning_hour"], 10)
+        self.assertEqual(bot.get_user(2)["morning_hour"], 11)
+        with bot.db() as connection:
+            connection.execute("UPDATE users SET morning_hour = 9 WHERE chat_id = 1")
+        bot.init_db()
+        self.assertEqual(bot.get_user(1)["morning_hour"], 9)
+
     def test_week_budget_uses_same_daily_rate_as_month_remaining(self):
         bot.ensure_user(1)
         with bot.db() as connection:
