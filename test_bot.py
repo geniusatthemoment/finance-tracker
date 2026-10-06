@@ -615,6 +615,41 @@ class StorageTest(unittest.TestCase):
         last_day = bot.budget_snapshot(user, date(2026, 10, 31))[0]
         self.assertEqual(first_day + second_day + last_day, 1001)
 
+    def test_status_command_shows_same_budget_numbers_as_morning(self):
+        bot.ensure_user(1)
+        with bot.db() as connection:
+            connection.execute("UPDATE users SET budget_cents = ? WHERE chat_id = 1", (2000000,))
+        bot.save_expenses(1, [("Еда", "", 120200)], date(2026, 10, 5))
+
+        class FrozenDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 10, 6, 12, 0, tzinfo=ZoneInfo("Asia/Tomsk")).astimezone(tz)
+
+        with patch.object(bot, "datetime", FrozenDateTime):
+            status = self.send_command(1, "/status")
+            morning = bot.morning_text(bot.get_user(1), date(2026, 10, 6))
+        self.assertIn("Потрачено в этом месяце: 1 202 ₽", status)
+        self.assertIn("Бюджет на месяц: 20 000 ₽", status)
+        for line in ("На сегодня: 723 ₽", "На неделю осталось: 4 338 ₽", "До конца месяца: 18 798 ₽"):
+            self.assertIn(line, status)
+            self.assertIn(line, morning)
+
+    def test_status_without_budget_still_shows_month_expenses(self):
+        bot.ensure_user(1)
+        bot.save_expenses(1, [("Еда", "", 50000)], date(2026, 10, 5))
+
+        class FrozenDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 10, 6, 12, 0, tzinfo=ZoneInfo("Asia/Tomsk")).astimezone(tz)
+
+        with patch.object(bot, "datetime", FrozenDateTime):
+            status = self.send_command(1, "/status")
+        self.assertIn("Потрачено в этом месяце: 500 ₽", status)
+        self.assertIn("Бюджет на месяц не задан", status)
+        self.assertNotIn("На сегодня:", status)
+
     def test_existing_users_table_gets_salary_column(self):
         with bot.db() as connection:
             connection.execute("DROP TABLE users")

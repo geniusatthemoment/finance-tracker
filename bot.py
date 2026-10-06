@@ -1388,14 +1388,33 @@ def budget_snapshot(user, today):
     return daily, week_left, remaining
 
 
-def morning_text(user, today):
+def budget_snapshot_lines(user, today):
     daily, week_left, month_left = budget_snapshot(user, today)
-    lines = [
-        "Доброе утро!",
+    return [
         f"На сегодня: {money(daily)}",
         f"На неделю осталось: {money(week_left)}",
         f"До конца месяца: {money(month_left)}",
     ]
+
+
+def budget_status_text(user, today):
+    month_start = today.replace(day=1)
+    month_spent = spent(user["chat_id"], month_start, today)
+    lines = [
+        f"Бюджет на {today:%d.%m.%Y}",
+        f"Потрачено в этом месяце: {money(month_spent)}",
+    ]
+    if not user["budget_cents"]:
+        return "\n".join([*lines, "Бюджет на месяц не задан. Установи его: /budget 70000"])
+    return "\n".join([
+        *lines,
+        f"Бюджет на месяц: {money(user['budget_cents'])}",
+        *budget_snapshot_lines(user, today),
+    ])
+
+
+def morning_text(user, today):
+    lines = ["Доброе утро!", *budget_snapshot_lines(user, today)]
     last_week = today - timedelta(days=6)
     top = category_totals(user["chat_id"], last_week, today, 1)
     if top:
@@ -1528,6 +1547,7 @@ def help_text():
         "Категория может быть любой. Сумму пиши без пробелов, дробную — через точку.\n\n"
         "Команды:\n"
         "/budget 70000 — бюджет на месяц\n"
+        "/status — расходы и остаток бюджета на сегодня\n"
         "/salary 100000 — зарплата за месяц (0 — убрать)\n"
         "/income подработка 5000 — другой доход; /incomes — список\n"
         "/refund 123 800 — возврат покупки #123 (номер в /history)\n"
@@ -1582,6 +1602,9 @@ def handle_message(message):
 
     if text in ("/start", "/help"):
         send(chat_id, "Готово. Я буду записывать твои траты.\n\n" + help_text())
+        return
+    if text == "/status":
+        send(chat_id, budget_status_text(user, user_today(user)))
         return
     if text.startswith("/budget"):
         pieces = text.split()
