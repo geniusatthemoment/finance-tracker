@@ -79,6 +79,7 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 chat_id INTEGER NOT NULL,
                 category TEXT NOT NULL,
+                place TEXT NOT NULL DEFAULT '',
                 comment TEXT NOT NULL DEFAULT '',
                 amount_cents INTEGER NOT NULL,
                 spent_on TEXT NOT NULL,
@@ -115,6 +116,7 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 chat_id INTEGER NOT NULL,
                 category TEXT NOT NULL,
+                place TEXT NOT NULL DEFAULT '',
                 comment TEXT NOT NULL DEFAULT '',
                 amount_cents INTEGER NOT NULL,
                 day_of_month INTEGER NOT NULL,
@@ -126,6 +128,7 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 chat_id INTEGER NOT NULL,
                 category TEXT NOT NULL,
+                place TEXT NOT NULL DEFAULT '',
                 comment TEXT NOT NULL DEFAULT '',
                 amount_cents INTEGER NOT NULL
             );
@@ -221,6 +224,18 @@ def init_db():
             connection.execute(
                 "ALTER TABLE expenses ADD COLUMN comment TEXT NOT NULL DEFAULT ''"
             )
+        if "place" not in columns:
+            connection.execute(
+                "ALTER TABLE expenses ADD COLUMN place TEXT NOT NULL DEFAULT ''"
+            )
+        for table in ("recurring_expenses", "favorites"):
+            table_columns = {
+                row["name"] for row in connection.execute(f"PRAGMA table_info({table})")
+            }
+            if "place" not in table_columns:
+                connection.execute(
+                    f"ALTER TABLE {table} ADD COLUMN place TEXT NOT NULL DEFAULT ''"
+                )
         rows = connection.execute("SELECT id, category FROM expenses").fetchall()
         connection.executemany(
             "UPDATE expenses SET category = ? WHERE id = ?",
@@ -461,6 +476,10 @@ def normalize_category(category):
     return " ".join(category.split()).casefold().capitalize()
 
 
+def normalize_place(place):
+    return " ".join(place.split()).casefold().capitalize()
+
+
 def business_day(local_now, cutoff_hour=4):
     """The expense day changes at 04:00 in the user's local timezone."""
     day = local_now.date()
@@ -483,7 +502,7 @@ def get_user(chat_id):
 
 
 def parse_expenses(text):
-    """Parse `category [comment] amount` using comma as the item separator."""
+    """Parse `category [place [comment]] amount` with comma-separated items."""
     parts = [part.strip() for part in text.split(",") if part.strip()]
     if not parts:
         raise ValueError("Пустое сообщение")
@@ -494,9 +513,13 @@ def parse_expenses(text):
         if not match:
             raise ValueError(f"Не понял: «{part}»")
         category = normalize_category(match.group(1))
-        comment = " ".join((match.group(2) or "").split())
+        details = (match.group(2) or "").split(maxsplit=1)
+        place = normalize_place(details[0]) if details else ""
+        comment = " ".join(details[1].split()) if len(details) > 1 else ""
         if not category or len(category) > 60 or any(char.isdigit() for char in category):
             raise ValueError(f"Некорректная категория: «{category}»")
+        if len(place) > 60:
+            raise ValueError("Название места слишком длинное")
         if len(comment) > 300:
             raise ValueError("Комментарий слишком длинный")
         try:
@@ -506,7 +529,7 @@ def parse_expenses(text):
         cents = int(amount * 100)
         if cents <= 0:
             raise ValueError("Сумма должна быть больше нуля")
-        parsed.append((category, comment, cents))
+        parsed.append((category, place, comment, cents))
     return parsed
 
 
@@ -549,31 +572,32 @@ def parse_expense_message(text, today, latest_date=None):
                 part = suffix.group(1).strip()
                 spent_on = parse_date(suffix.group(2), today, latest_date)
         parsed = parse_expenses(part)
-        category, comment, cents = parsed[0]
-        result.append((category, comment, cents, spent_on, monthly))
+        category, place, comment, cents = parsed[0]
+        result.append((category, place, comment, cents, spent_on, monthly))
     return result
 
 
 def save_expenses(chat_id, items, spent_on):
     now = datetime.utcnow().isoformat()
+    values = []
+    for item in items:
+        if len(item) == 3:
+            category, comment, cents = item
+            place = ""
+        else:
+            category, place, comment, cents = item
+        values.append((
+            chat_id, normalize_category(category), normalize_place(place),
+            comment, cents, spent_on.isoformat(), now,
+        ))
     with db() as connection:
         connection.executemany(
             """
             INSERT INTO expenses(
-                chat_id, category, comment, amount_cents, spent_on, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                chat_id, category, place, comment, amount_cents, spent_on, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            [
-                (
-                    chat_id,
-                    normalize_category(category),
-                    comment,
-                    cents,
-                    spent_on.isoformat(),
-                    now,
-                )
-                for category, comment, cents in items
-            ],
+            values,
         )
         connection.execute(
             """
@@ -586,7 +610,7 @@ def save_expenses(chat_id, items, spent_on):
 
 
 def save_monthly_expense(
-    chat_id, category, comment, amount_cents, month_date, acknowledge=False
+    chat_id, category, comment, amount_cents, month_date, acknowledge=False, place=""
 ):
     days_in_month = calendar.monthrange(month_date.year, month_date.month)[1]
     daily_cents, remainder = divmod(amount_cents, days_in_month)
@@ -600,6 +624,7 @@ def save_monthly_expense(
             (
                 chat_id,
                 normalize_category(category),
+                normalize_place(place),
                 comment,
                 cents,
                 spent_on.isoformat(),
@@ -611,8 +636,8 @@ def save_monthly_expense(
         connection.executemany(
             """
             INSERT INTO expenses(
-                chat_id, category, comment, amount_cents, spent_on, created_at, batch_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                chat_id, category, place, comment, amount_cents, spent_on, created_at, batch_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
@@ -655,6 +680,66 @@ def category_totals(chat_id, start, end, limit=5):
         ).fetchall()
 
 
+def category_report_text(chat_id, category, month_start):
+    category = normalize_category(category)
+    month_end = month_start.replace(
+        day=calendar.monthrange(month_start.year, month_start.month)[1]
+    )
+    with db() as connection:
+        places = connection.execute(
+            """
+            SELECT place, SUM(amount_cents) AS total,
+                   COUNT(DISTINCT CASE WHEN amount_cents > 0 THEN
+                       CASE WHEN batch_id IS NULL THEN 'expense:' || id
+                            ELSE 'batch:' || batch_id END
+                   END) AS purchases
+            FROM expenses
+            WHERE chat_id = ? AND category = ? AND spent_on BETWEEN ? AND ?
+            GROUP BY place ORDER BY total DESC, place
+            """,
+            (chat_id, category, month_start.isoformat(), month_end.isoformat()),
+        ).fetchall()
+        recent = connection.execute(
+            """
+            SELECT place, comment, SUM(amount_cents) AS total,
+                   MIN(spent_on) AS first_day
+            FROM expenses
+            WHERE chat_id = ? AND category = ? AND spent_on BETWEEN ? AND ?
+            GROUP BY CASE WHEN batch_id IS NULL THEN 'expense:' || id
+                          ELSE 'batch:' || batch_id END
+            ORDER BY MAX(spent_on) DESC, MAX(id) DESC LIMIT 5
+            """,
+            (chat_id, category, month_start.isoformat(), month_end.isoformat()),
+        ).fetchall()
+    if not places:
+        return f"За {month_start:%m.%Y} трат в категории «{category}» нет."
+    total = sum(row["total"] for row in places)
+    purchases = sum(row["purchases"] for row in places)
+    lines = [
+        f"Категория «{category}» за {month_start:%m.%Y}",
+        f"Всего: {money(total)}",
+        f"Покупок: {purchases}",
+        f"Средний чек: {money(total // purchases) if purchases else '—'}",
+        "",
+        "Где потрачено больше всего:",
+    ]
+    for row in places[:10]:
+        place = row["place"] or "Без места"
+        share = round(row["total"] * 100 / total) if total else 0
+        lines.append(
+            f"• {place}: {money(row['total'])} ({share}%, покупок: {row['purchases']})"
+        )
+    if len(places) > 10:
+        lines.append(f"• Остальные места: {money(sum(row['total'] for row in places[10:]))}")
+    lines.extend(["", "Последние покупки:"])
+    for row in recent:
+        day = date.fromisoformat(row["first_day"])
+        place = row["place"] or "Без места"
+        comment = f" · {row['comment'][:80]}" if row["comment"] else ""
+        lines.append(f"• {day:%d.%m} · {place} · {money(row['total'])}{comment}")
+    return "\n".join(lines)
+
+
 def daily_totals(chat_id, start, end):
     with db() as connection:
         return connection.execute(
@@ -677,6 +762,7 @@ def recent_expenses(chat_id, limit=10):
             SELECT
                 MAX(id) AS id,
                 category,
+                place,
                 comment,
                 SUM(amount_cents) AS total,
                 MIN(spent_on) AS start_day,
@@ -699,7 +785,7 @@ def expense_details(chat_id, expense_id):
     with db() as connection:
         row = connection.execute(
             """
-            SELECT id, category, comment, amount_cents, spent_on, batch_id
+            SELECT id, category, place, comment, amount_cents, spent_on, batch_id
             FROM expenses WHERE chat_id = ? AND id = ?
             """,
             (chat_id, expense_id),
@@ -710,6 +796,7 @@ def expense_details(chat_id, expense_id):
             return {
                 "id": row["id"],
                 "category": row["category"],
+                "place": row["place"],
                 "comment": row["comment"],
                 "total": row["amount_cents"],
                 "start_day": row["spent_on"],
@@ -727,6 +814,7 @@ def expense_details(chat_id, expense_id):
         return {
             "id": row["id"],
             "category": row["category"],
+            "place": row["place"],
             "comment": row["comment"],
             "total": summary["total"],
             "start_day": summary["start_day"],
@@ -747,6 +835,7 @@ def expense_details_text(details):
         f"Покупка #{details['id']}\n"
         f"{when}\n"
         f"Категория: {details['category']}\n"
+        f"Место: {details['place'] or '—'}\n"
         f"Комментарий: {comment}\n"
         f"Сумма: {money(details['total'])}"
     )
@@ -759,7 +848,8 @@ def history_message(chat_id):
     buttons = []
     for row in rows:
         start_day = date.fromisoformat(row["start_day"])
-        label = f"{start_day:%d.%m} · {row['category']} · {money(row['total'])}"
+        place = f" · {row['place']}" if row["place"] else ""
+        label = f"{start_day:%d.%m} · {row['category']}{place} · {money(row['total'])}"
         buttons.append(
             [{"text": label, "callback_data": f"expense:{row['id']}"}]
         )
@@ -837,7 +927,7 @@ def replace_expense(chat_id, expense_id, item, today):
     details = expense_details(chat_id, expense_id)
     if not details:
         return None
-    category, comment, cents, spent_on, monthly = item
+    category, place, comment, cents, spent_on, monthly = item
     delete_expense(chat_id, expense_id)
     if monthly:
         save_monthly_expense(
@@ -847,10 +937,11 @@ def replace_expense(chat_id, expense_id, item, today):
             cents,
             spent_on,
             acknowledge=spent_on == today,
+            place=place,
         )
     else:
-        save_expenses(chat_id, [(category, comment, cents)], spent_on)
-    return category, comment, cents, spent_on, monthly
+        save_expenses(chat_id, [(category, place, comment, cents)], spent_on)
+    return category, place, comment, cents, spent_on, monthly
 
 
 def period_report_text(chat_id, start, end, zero_through=None):
@@ -1127,15 +1218,15 @@ def category_limit_warning(chat_id, category, spent_on):
     return None
 
 
-def add_recurring(chat_id, day_of_month, category, comment, amount_cents):
+def add_recurring(chat_id, day_of_month, category, comment, amount_cents, place=""):
     with db() as connection:
         cursor = connection.execute(
             """
             INSERT INTO recurring_expenses(
-                chat_id, category, comment, amount_cents, day_of_month
-            ) VALUES (?, ?, ?, ?, ?)
+                chat_id, category, place, comment, amount_cents, day_of_month
+            ) VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (chat_id, normalize_category(category), comment, amount_cents, day_of_month),
+            (chat_id, normalize_category(category), normalize_place(place), comment, amount_cents, day_of_month),
         )
         return cursor.lastrowid
 
@@ -1144,7 +1235,7 @@ def recurring_message(chat_id):
     with db() as connection:
         rows = connection.execute(
             """
-            SELECT id, category, comment, amount_cents, day_of_month
+            SELECT id, category, place, comment, amount_cents, day_of_month
             FROM recurring_expenses
             WHERE chat_id = ? AND active = 1 ORDER BY day_of_month, id
             """,
@@ -1158,9 +1249,10 @@ def recurring_message(chat_id):
     lines = ["Регулярные платежи:"]
     buttons = []
     for row in rows:
+        place = f" · {row['place']}" if row["place"] else ""
         comment = f" — {row['comment']}" if row["comment"] else ""
         lines.append(
-            f"• {row['day_of_month']}-го: {row['category']}{comment}, {money(row['amount_cents'])}"
+            f"• {row['day_of_month']}-го: {row['category']}{place}{comment}, {money(row['amount_cents'])}"
         )
         buttons.append(
             [
@@ -1193,7 +1285,7 @@ def process_recurring(user, today):
         spent_on = date(today.year, today.month, due_day)
         save_expenses(
             user["chat_id"],
-            [(row["category"], row["comment"], row["amount_cents"])],
+            [(row["category"], row["place"], row["comment"], row["amount_cents"])],
             spent_on,
         )
         with db() as connection:
@@ -1209,12 +1301,12 @@ def process_recurring(user, today):
         )
 
 
-def add_favorite(chat_id, category, comment, amount_cents):
+def add_favorite(chat_id, category, comment, amount_cents, place=""):
     with db() as connection:
         cursor = connection.execute(
-            "INSERT INTO favorites(chat_id, category, comment, amount_cents) "
-            "VALUES (?, ?, ?, ?)",
-            (chat_id, normalize_category(category), comment, amount_cents),
+            "INSERT INTO favorites(chat_id, category, place, comment, amount_cents) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (chat_id, normalize_category(category), normalize_place(place), comment, amount_cents),
         )
         return cursor.lastrowid
 
@@ -1232,6 +1324,8 @@ def favorites_message(chat_id):
     buttons = []
     for row in rows:
         title = row["category"]
+        if row["place"]:
+            title += f" · {row['place']}"
         if row["comment"]:
             title += f" · {row['comment']}"
         buttons.append(
@@ -1250,7 +1344,7 @@ def search_expenses(chat_id, query, limit=20):
     with db() as connection:
         rows = connection.execute(
             """
-            SELECT MAX(id) AS id, category, comment, SUM(amount_cents) AS total,
+            SELECT MAX(id) AS id, category, place, comment, SUM(amount_cents) AS total,
                    MIN(spent_on) AS start_day, MAX(spent_on) AS end_day, batch_id
             FROM expenses
             WHERE chat_id = ?
@@ -1261,20 +1355,24 @@ def search_expenses(chat_id, query, limit=20):
             (chat_id,),
         ).fetchall()
     needle = query.casefold()
-    return [row for row in rows if needle in row["comment"].casefold()][:limit]
+    return [
+        row for row in rows
+        if needle in row["comment"].casefold() or needle in row["place"].casefold()
+    ][:limit]
 
 
 def search_message(chat_id, query):
     rows = search_expenses(chat_id, query)
     if not rows:
-        return f"По комментарию «{query}» ничего не найдено.", None
+        return f"По месту или комментарию «{query}» ничего не найдено.", None
     buttons = []
     for row in rows:
         day = date.fromisoformat(row["start_day"])
+        place = f" · {row['place']}" if row["place"] else ""
         buttons.append(
             [
                 {
-                    "text": f"{day:%d.%m} · {row['category']} · {money(row['total'])}",
+                    "text": f"{day:%d.%m} · {row['category']}{place} · {money(row['total'])}",
                     "callback_data": f"expense:{row['id']}",
                 }
             ]
@@ -1286,7 +1384,7 @@ def export_csv(chat_id):
     with db() as connection:
         rows = connection.execute(
             """
-            SELECT id, spent_on, category, comment, amount_cents, batch_id, created_at
+            SELECT id, spent_on, category, place, comment, amount_cents, batch_id, created_at
             FROM expenses WHERE chat_id = ? ORDER BY spent_on, id
             """,
             (chat_id,),
@@ -1294,7 +1392,7 @@ def export_csv(chat_id):
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(
-        ["id", "date", "category", "comment", "amount_rub", "monthly_batch", "created_at"]
+        ["id", "date", "category", "place", "comment", "amount_rub", "monthly_batch", "created_at"]
     )
     for row in rows:
         writer.writerow(
@@ -1302,6 +1400,7 @@ def export_csv(chat_id):
                 row["id"],
                 row["spent_on"],
                 row["category"],
+                row["place"],
                 row["comment"],
                 f"{Decimal(row['amount_cents']) / 100:.2f}",
                 row["batch_id"] or "",
@@ -1333,6 +1432,7 @@ def import_csv_bytes(chat_id, content):
             try:
                 spent_on = date.fromisoformat(record["date"])
                 category = normalize_category(record["category"])
+                place = normalize_place(record.get("place") or "")
                 comment = (record["comment"] or "").strip()
                 amount = Decimal(record["amount_rub"])
                 if not amount.is_finite() or amount.as_tuple().exponent < -2:
@@ -1340,18 +1440,18 @@ def import_csv_bytes(chat_id, content):
                 cents = int(amount * 100)
             except (ValueError, TypeError, InvalidOperation, OverflowError) as error:
                 raise ValueError(f"Ошибка в строке {len(rows) + 2} CSV.") from error
-            if not category or len(category) > 60 or len(comment) > 300 or cents == 0:
+            if not category or len(category) > 60 or len(place) > 60 or len(comment) > 300 or cents == 0:
                 raise ValueError(f"Ошибка в строке {len(rows) + 2} CSV.")
             imported_batch = record.get("monthly_batch")
             if imported_batch:
                 imported_batch = f"import:{digest[:12]}:{imported_batch}"
-            rows.append((chat_id, category, comment, cents, spent_on.isoformat(), now, imported_batch))
+            rows.append((chat_id, category, place, comment, cents, spent_on.isoformat(), now, imported_batch))
     except UnicodeDecodeError as error:
         raise ValueError("CSV должен быть в UTF-8.") from error
     with db() as connection:
         connection.executemany(
-            """INSERT INTO expenses(chat_id, category, comment, amount_cents, spent_on, created_at, batch_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""", rows,
+            """INSERT INTO expenses(chat_id, category, place, comment, amount_cents, spent_on, created_at, batch_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""", rows,
         )
         connection.execute(
             "INSERT INTO imported_files(chat_id, sha256) VALUES (?, ?)", (chat_id, digest)
@@ -1545,8 +1645,9 @@ def report_text(user):
 
 def help_text():
     return (
-        "Первое слово — категория, последнее — сумма, между ними можно написать комментарий:\n"
-        "еда обед с Колей 850\n\n"
+        "Первое слово — категория, второе — место, дальше комментарий, в конце сумма:\n"
+        "еда Кафе обед с Колей 850\n"
+        "Если место не нужно: еда 500\n\n"
         "Несколько трат разделяй запятыми:\n"
         "еда 500, супермаркеты 2300, транспорт 250\n\n"
         "Чтобы указать дату, поставь ее в начале сообщения:\n"
@@ -1567,12 +1668,14 @@ def help_text():
         "/report — с октября отчёт за календарный месяц\n"
         "/report 10.2026 — конкретный месяц\n"
         "/report 01.09 15.09 — отчет за период\n"
+        "/category Еда — где больше всего тратишь в категории\n"
+        "/category Еда 09.2026 — категория за другой месяц\n"
         "/history — последние покупки и комментарии\n"
         "/limits — лимиты категорий\n"
         "/limit Еда 20000 — задать лимит\n"
         "/recurring — регулярные платежи\n"
         "/favorites — быстрые траты\n"
-        "/search текст — поиск по комментариям\n"
+        "/search текст — поиск по месту и комментариям\n"
         "/compare — сравнить недели\n"
         "/compare_months — сравнить месяцы; /week — прошлая неделя\n"
         "/export — выгрузить CSV\n"
@@ -1616,6 +1719,22 @@ def handle_message(message):
         return
     if text == "/status":
         send(chat_id, budget_status_text(user, user_today(user)))
+        return
+    if text == "/category" or text.startswith("/category "):
+        pieces = text.split()
+        if len(pieces) not in (2, 3):
+            send(chat_id, "Напиши /category Еда или /category Еда 09.2026")
+            return
+        calendar_today = user_calendar_today(user)
+        try:
+            month = (
+                parse_report_month(pieces[2], calendar_today)
+                if len(pieces) == 3 else calendar_today.replace(day=1)
+            )
+        except ValueError as error:
+            send(chat_id, str(error))
+            return
+        send(chat_id, category_report_text(chat_id, pieces[1], month))
         return
     if text.startswith("/budget"):
         pieces = text.split()
@@ -1707,6 +1826,7 @@ def handle_message(message):
             return
         reference = parts[0].lstrip("#")
         comment = "Возврат"
+        place = ""
         if reference.isdigit():
             details = expense_details(chat_id, int(reference))
             if not details or details["total"] <= 0:
@@ -1722,6 +1842,7 @@ def handle_message(message):
                 send(chat_id, "Возврат не может быть больше суммы покупки.")
                 return
             category = details["category"]
+            place = details["place"]
             comment = f"Возврат #{reference}"
         else:
             category = normalize_category(parts[0])
@@ -1729,7 +1850,7 @@ def handle_message(message):
             send(chat_id, "Категория слишком длинная.")
             return
         today = user_today(user)
-        save_expenses(chat_id, [(category, comment, -cents)], today)
+        save_expenses(chat_id, [(category, place, comment, -cents)], today)
         send(chat_id, f"Записал возврат за {today:%d.%m}: {category} −{money(cents)}")
         return
     if text.startswith("/goal"):
@@ -1917,8 +2038,8 @@ def handle_message(message):
         if len(parsed) != 1:
             send(chat_id, "Добавляй по одному регулярному платежу.")
             return
-        category, comment, cents = parsed[0]
-        add_recurring(chat_id, day_of_month, category, comment, cents)
+        category, place, comment, cents = parsed[0]
+        add_recurring(chat_id, day_of_month, category, comment, cents, place=place)
         send(
             chat_id,
             f"Добавил регулярный платёж {day_of_month}-го числа: "
@@ -1938,8 +2059,8 @@ def handle_message(message):
         if len(parsed) != 1:
             send(chat_id, "Добавляй по одной избранной трате.")
             return
-        category, comment, cents = parsed[0]
-        add_favorite(chat_id, category, comment, cents)
+        category, place, comment, cents = parsed[0]
+        add_favorite(chat_id, category, comment, cents, place=place)
         send(chat_id, f"Добавил в избранное: {category} — {money(cents)}.")
         return
     if text.startswith("/search "):
@@ -2006,11 +2127,12 @@ def handle_message(message):
         if not replacement:
             send(chat_id, "Покупка уже не найдена.")
             return
-        category, comment, cents, spent_on, monthly = replacement
+        category, place, comment, cents, spent_on, monthly = replacement
         suffix = " ЕЖЕМЕСЯЧНО" if monthly else ""
         send(
             chat_id,
             f"Обновил: {spent_on:%d.%m.%Y} · {category} · {money(cents)}{suffix}"
+            + (f"\nМесто: {place}" if place else "")
             + (f"\nКомментарий: {comment}" if comment else ""),
         )
         return
@@ -2019,32 +2141,32 @@ def handle_message(message):
     except ValueError as error:
         send(
             chat_id,
-            f"{error}. Формат: категория комментарий сумма\n"
-            "Например: еда обед с Колей 850, транспорт такси 250\n"
-            "С датой: 23.09 еда обед 500, транспорт такси 250",
+            f"{error}. Формат: категория место комментарий сумма\n"
+            "Например: еда Кафе обед с Колей 850, транспорт Такси 250\n"
+            "С датой: 23.09 еда Кафе обед 500, транспорт Такси 250",
         )
         return
 
     by_date = {}
     monthly_items = []
-    for category, comment, cents, spent_on, monthly in items:
+    for category, place, comment, cents, spent_on, monthly in items:
         if monthly:
-            monthly_items.append((category, comment, cents, spent_on))
+            monthly_items.append((category, place, comment, cents, spent_on))
         else:
-            by_date.setdefault(spent_on, []).append((category, comment, cents))
+            by_date.setdefault(spent_on, []).append((category, place, comment, cents))
     response = []
     for spent_on in sorted(by_date):
         dated_items = by_date[spent_on]
         save_expenses(chat_id, dated_items, spent_on)
         saved = ", ".join(
-            f"{category} — {money(cents)}"
+            f"{category}{f' · {place}' if place else ''} — {money(cents)}"
             + (f" ({comment})" if comment else "")
-            for category, comment, cents in dated_items
+            for category, place, comment, cents in dated_items
         )
         day_total = spent(chat_id, spent_on, spent_on)
         label = "сегодня" if spent_on == today else spent_on.strftime("%d.%m.%Y")
         response.append(f"Записал за {label}: {saved}\nВсего за день: {money(day_total)}")
-        for category, _comment, _cents in dated_items:
+        for category, _place, _comment, _cents in dated_items:
             warning = category_limit_warning(chat_id, category, spent_on)
             if warning and warning not in response:
                 response.append(warning)
@@ -2052,7 +2174,7 @@ def handle_message(message):
                 anomaly = anomaly_text(chat_id, category, today)
                 if anomaly and anomaly not in response:
                     response.append(anomaly)
-    for category, comment, cents, spent_on in monthly_items:
+    for category, place, comment, cents, spent_on in monthly_items:
         daily_cents, days_in_month = save_monthly_expense(
             chat_id,
             category,
@@ -2060,10 +2182,11 @@ def handle_message(message):
             cents,
             spent_on,
             acknowledge=spent_on == today,
+            place=place,
         )
         month_label = spent_on.strftime("%m.%Y")
         response.append(
-            f"Распределил за {month_label}: {category} — {money(cents)}\n"
+            f"Распределил за {month_label}: {category}{f' · {place}' if place else ''} — {money(cents)}\n"
             f"На {days_in_month} дней: примерно {money(daily_cents)} в день"
         )
         warning = category_limit_warning(chat_id, category, spent_on)
@@ -2129,7 +2252,7 @@ def handle_callback(callback):
         send(
             chat_id,
             "Отправь исправленную покупку целиком. Например:\n"
-            "Еда новый комментарий 900 25.09\n\n"
+            "Еда Кафе новый комментарий 900 25.09\n\n"
             "Для отмены: /cancel",
         )
     elif data.startswith("delete:"):
@@ -2252,7 +2375,7 @@ def handle_callback(callback):
             return
         with db() as connection:
             favorite = connection.execute(
-                "SELECT category, comment, amount_cents FROM favorites "
+                "SELECT category, place, comment, amount_cents FROM favorites "
                 "WHERE chat_id = ? AND id = ?",
                 (chat_id, favorite_id),
             ).fetchone()
@@ -2266,11 +2389,12 @@ def handle_callback(callback):
         today = user_today(user)
         save_expenses(
             chat_id,
-            [(favorite["category"], favorite["comment"], favorite["amount_cents"])],
+            [(favorite["category"], favorite["place"], favorite["comment"], favorite["amount_cents"])],
             today,
         )
         api("answerCallbackQuery", callback_query_id=callback["id"], text="Записал")
-        message = f"Записал: {favorite['category']} — {money(favorite['amount_cents'])}"
+        place = f" · {favorite['place']}" if favorite["place"] else ""
+        message = f"Записал: {favorite['category']}{place} — {money(favorite['amount_cents'])}"
         warning = category_limit_warning(chat_id, favorite["category"], today)
         if warning:
             message += "\n" + warning

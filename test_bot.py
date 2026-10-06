@@ -10,28 +10,35 @@ import bot
 
 class ExpenseParserTest(unittest.TestCase):
     def test_one_expense(self):
-        self.assertEqual(bot.parse_expenses("еда 500"), [("Еда", "", 50000)])
+        self.assertEqual(bot.parse_expenses("еда 500"), [("Еда", "", "", 50000)])
 
-    def test_words_between_category_and_amount_become_comment(self):
+    def test_second_word_is_place_and_rest_is_comment(self):
         self.assertEqual(
-            bot.parse_expenses("еда обед с Колей 850"),
-            [("Еда", "обед с Колей", 85000)],
+            bot.parse_expenses("еда кафе обед с Колей 850"),
+            [("Еда", "Кафе", "обед с Колей", 85000)],
+        )
+        self.assertEqual(
+            bot.parse_expenses("еда ПЯТЁРОЧКА хлеб 100, еда пятёрочка молоко 80"),
+            [
+                ("Еда", "Пятёрочка", "хлеб", 10000),
+                ("Еда", "Пятёрочка", "молоко", 8000),
+            ],
         )
 
     def test_many_expenses(self):
         self.assertEqual(
             bot.parse_expenses("еда 500, супермаркеты 2300, мой кот 99.50"),
             [
-                ("Еда", "", 50000),
-                ("Супермаркеты", "", 230000),
-                ("Мой", "кот", 9950),
+                ("Еда", "", "", 50000),
+                ("Супермаркеты", "", "", 230000),
+                ("Мой", "Кот", "", 9950),
             ],
         )
 
     def test_custom_category(self):
         self.assertEqual(
             bot.parse_expenses("другое какая угодно категория 42"),
-            [("Другое", "какая угодно категория", 4200)],
+            [("Другое", "Какая", "угодно категория", 4200)],
         )
 
     def test_bad_format_rejected_atomically(self):
@@ -59,7 +66,7 @@ class ExpenseParserTest(unittest.TestCase):
         today = date(2026, 9, 24)
         self.assertEqual(
             bot.parse_expense_message("еда 500", today),
-            [("Еда", "", 50000, today, False)],
+            [("Еда", "", "", 50000, today, False)],
         )
 
     def test_expense_day_changes_at_four_am(self):
@@ -78,7 +85,7 @@ class ExpenseParserTest(unittest.TestCase):
             bot.parse_expense_message(
                 "01.10.2026 еда 500", date(2026, 9, 30), date(2026, 10, 1)
             ),
-            [("Еда", "", 50000, date(2026, 10, 1), False)],
+            [("Еда", "", "", 50000, date(2026, 10, 1), False)],
         )
 
     def test_date_prefix_applies_to_every_expense(self):
@@ -87,8 +94,8 @@ class ExpenseParserTest(unittest.TestCase):
         self.assertEqual(
             bot.parse_expense_message("23.09 еда 500, транспорт 250", today),
             [
-                ("Еда", "", 50000, expected, False),
-                ("Транспорт", "", 25000, expected, False),
+                ("Еда", "", "", 50000, expected, False),
+                ("Транспорт", "", "", 25000, expected, False),
             ],
         )
 
@@ -97,22 +104,35 @@ class ExpenseParserTest(unittest.TestCase):
         self.assertEqual(
             bot.parse_expense_message("еда 500 22.09, транспорт 250 23.09.2026", today),
             [
-                ("Еда", "", 50000, date(2026, 9, 22), False),
-                ("Транспорт", "", 25000, date(2026, 9, 23), False),
+                ("Еда", "", "", 50000, date(2026, 9, 22), False),
+                ("Транспорт", "", "", 25000, date(2026, 9, 23), False),
             ],
         )
 
     def test_category_is_normalized(self):
         self.assertEqual(
             bot.parse_expenses("тРаНсПоРт 500"),
-            [("Транспорт", "", 50000)],
+            [("Транспорт", "", "", 50000)],
         )
 
     def test_monthly_flag(self):
         today = date(2026, 9, 24)
         self.assertEqual(
             bot.parse_expense_message("зал 2500 ЕЖЕМЕСЯЧНО", today),
-            [("Зал", "", 250000, today, True)],
+            [("Зал", "", "", 250000, today, True)],
+        )
+
+    def test_place_comment_date_and_monthly_flag_work_together(self):
+        today = date(2026, 10, 6)
+        self.assertEqual(
+            bot.parse_expense_message(
+                "05.10 еда Кафе обед с Колей 850, зал Фитнес абонемент 3100 ЕЖЕМЕСЯЧНО",
+                today,
+            ),
+            [
+                ("Еда", "Кафе", "обед с Колей", 85000, date(2026, 10, 5), False),
+                ("Зал", "Фитнес", "абонемент", 310000, date(2026, 10, 5), True),
+            ],
         )
 
     def test_future_date_is_rejected(self):
@@ -248,6 +268,19 @@ class StorageTest(unittest.TestCase):
         self.assertEqual(bot.spent(1, date(2026, 9, 1), date(2026, 9, 30)), 200000)
         self.assertEqual(bot.spent(2, date(2026, 9, 1), date(2026, 9, 30)), 200000)
 
+    def test_export_import_preserves_places_and_old_csv_stays_supported(self):
+        bot.ensure_user(1)
+        bot.ensure_user(2)
+        day = date(2026, 10, 5)
+        bot.save_expenses(1, [("Еда", "Пятёрочка", "хлеб", 50000)], day)
+        content = bot.export_csv(1)
+        self.assertIn("place", content.decode("utf-8-sig").splitlines()[0])
+        self.assertEqual(bot.import_csv_bytes(2, content), 1)
+        self.assertEqual(bot.recent_expenses(2)[0]["place"], "Пятёрочка")
+        old_csv = b"date,category,comment,amount_rub\n2026-10-06,food,lunch,50.00\n"
+        self.assertEqual(bot.import_csv_bytes(2, old_csv), 1)
+        self.assertEqual(bot.recent_expenses(2)[0]["place"], "")
+
     def test_salary_command_keeps_earlier_dates(self):
         bot.ensure_user(1)
         with bot.db() as connection:
@@ -267,6 +300,29 @@ class StorageTest(unittest.TestCase):
         self.assertEqual(bot.salary_for_day(1, day), 4000000)
         self.assertEqual(bot.spent(1, day, day), 50000)
         self.assertEqual(bot.get_user(1)["day_cutoff_hour"], 4)
+        self.assertEqual(bot.recent_expenses(1)[0]["place"], "")
+        self.assertEqual(bot.recent_expenses(1)[0]["comment"], "обед")
+
+    def test_upgrade_adds_place_without_guessing_old_comments(self):
+        with bot.db() as connection:
+            connection.execute("DROP TABLE expenses")
+            connection.execute(
+                """CREATE TABLE expenses (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL,
+                    category TEXT NOT NULL, comment TEXT NOT NULL DEFAULT '',
+                    amount_cents INTEGER NOT NULL, spent_on TEXT NOT NULL,
+                    created_at TEXT NOT NULL, batch_id TEXT
+                )"""
+            )
+            connection.execute(
+                """INSERT INTO expenses(chat_id, category, comment, amount_cents, spent_on, created_at)
+                   VALUES (1, 'еда', 'обед с Колей', 85000, '2026-10-05', '2026-10-05')"""
+            )
+        bot.init_db()
+        row = bot.recent_expenses(1)[0]
+        self.assertEqual(row["category"], "Еда")
+        self.assertEqual(row["place"], "")
+        self.assertEqual(row["comment"], "обед с Колей")
 
     def test_bus_reclassification_is_one_time_and_only_for_first_user(self):
         first_user, second_user = 563057258, 656675199
@@ -460,6 +516,46 @@ class StorageTest(unittest.TestCase):
         short = bot.period_report_text(1, date(2026, 10, 1), date(2026, 10, 1))
         self.assertIn("Отчёт за 01.10.2026 — 01.10.2026", short)
         self.assertIn("Всего: 100 ₽", short)
+
+    def test_category_report_ranks_places_and_is_scoped_to_user_and_month(self):
+        bot.ensure_user(1)
+        bot.ensure_user(2)
+        day = date(2026, 10, 5)
+        bot.save_expenses(1, [("Еда", "Пятёрочка", "хлеб", 100000)], day)
+        bot.save_expenses(1, [("еда", "пятёрочка", "молоко", 50000)], day)
+        bot.save_expenses(1, [("Еда", "Кафе", "обед", 80000)], day)
+        bot.save_expenses(1, [("Еда", "старая запись", 20000)], day)
+        bot.save_expenses(1, [("Еда", "Кафе", "сентябрь", 900000)], date(2026, 9, 30))
+        bot.save_expenses(2, [("Еда", "Кафе", "чужая", 700000)], day)
+
+        class FrozenDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 10, 6, 12, 0, tzinfo=ZoneInfo("Asia/Tomsk")).astimezone(tz)
+
+        with patch.object(bot, "datetime", FrozenDateTime):
+            report = self.send_command(1, "/category еДА")
+            september = self.send_command(1, "/category Еда 09.2026")
+        self.assertIn("Всего: 2 500 ₽", report)
+        self.assertIn("Покупок: 4", report)
+        self.assertIn("Средний чек: 625 ₽", report)
+        self.assertIn("Пятёрочка: 1 500 ₽ (60%, покупок: 2)", report)
+        self.assertIn("Кафе: 800 ₽ (32%, покупок: 1)", report)
+        self.assertIn("Без места: 200 ₽ (8%, покупок: 1)", report)
+        self.assertLess(report.index("Пятёрочка: 1 500 ₽"), report.index("Кафе: 800 ₽"))
+        self.assertNotIn("7 000 ₽", report)
+        self.assertIn("Всего: 9 000 ₽", september)
+
+    def test_monthly_allocation_keeps_place_and_counts_as_one_purchase(self):
+        bot.ensure_user(1)
+        bot.save_monthly_expense(
+            1, "Зал", "абонемент", 310000, date(2026, 10, 1), place="Фитнес"
+        )
+        report = bot.category_report_text(1, "зал", date(2026, 10, 1))
+        self.assertIn("Всего: 3 100 ₽", report)
+        self.assertIn("Покупок: 1", report)
+        self.assertIn("Фитнес: 3 100 ₽", report)
+        self.assertIn("абонемент", report)
 
     def test_current_month_average_uses_recorded_days_only(self):
         bot.ensure_user(1)
@@ -764,15 +860,28 @@ class StorageTest(unittest.TestCase):
         self.assertEqual(details["total"], 85000)
         self.assertIsNone(bot.expense_details(2, expense_id))
 
+    def test_new_expense_saves_place_and_history_can_open_it(self):
+        bot.ensure_user(1)
+        day = bot.user_today(bot.get_user(1))
+        answer = self.send_command(1, "Еда Пятёрочка хлеб и молоко 850")
+        self.assertIn("Еда · Пятёрочка — 850 ₽", answer)
+        row = bot.recent_expenses(1)[0]
+        details = bot.expense_details(1, row["id"])
+        self.assertEqual(details["place"], "Пятёрочка")
+        self.assertEqual(details["comment"], "хлеб и молоко")
+        self.assertIn("Место: Пятёрочка", bot.expense_details_text(details))
+        self.assertEqual(len(bot.search_expenses(1, "пятёрочка")), 1)
+        self.assertEqual(bot.spent(1, day, day), 85000)
+
     def test_specific_expense_can_be_replaced_and_deleted(self):
         day = date(2026, 9, 24)
         bot.save_expenses(1, [("Еда", "старый", 50000)], day)
         expense_id = bot.recent_expenses(1)[0]["id"]
-        replacement = ("Транспорт", "такси", 70000, day, False)
+        replacement = ("Транспорт", "Такси", "домой", 70000, day, False)
 
         bot.replace_expense(1, expense_id, replacement, day)
         row = bot.recent_expenses(1)[0]
-        self.assertEqual((row["category"], row["comment"], row["total"]), ("Транспорт", "такси", 70000))
+        self.assertEqual((row["category"], row["place"], row["comment"], row["total"]), ("Транспорт", "Такси", "домой", 70000))
         deleted = bot.delete_expense(1, row["id"])
         self.assertEqual(deleted["total"], 70000)
         self.assertEqual(bot.recent_expenses(1), [])
@@ -801,6 +910,27 @@ class StorageTest(unittest.TestCase):
             bot.process_recurring(user, date(2026, 9, 26))
         self.assertEqual(bot.spent(1, date(2026, 9, 5), date(2026, 9, 5)), 90000)
         self.assertEqual(send_mock.call_count, 1)
+
+    def test_recurring_and_favorite_keep_their_place(self):
+        bot.ensure_user(1)
+        bot.add_recurring(1, 5, "Интернет", "домашний", 90000, place="Провайдер")
+        with patch.object(bot, "send"):
+            bot.process_recurring(bot.get_user(1), date(2026, 10, 6))
+        self.assertEqual(bot.recent_expenses(1)[0]["place"], "Провайдер")
+
+        favorite_id = bot.add_favorite(1, "Еда", "обед", 60000, place="Кафе")
+        old_ids = bot.ALLOWED_USER_IDS
+        bot.ALLOWED_USER_IDS = frozenset({1})
+        try:
+            with patch.object(bot, "api"), patch.object(bot, "send"):
+                bot.handle_callback({
+                    "id": "favorite", "from": {"id": 1},
+                    "data": f"favorite:{favorite_id}",
+                    "message": {"message_id": 1, "chat": {"id": 1}},
+                })
+        finally:
+            bot.ALLOWED_USER_IDS = old_ids
+        self.assertEqual(bot.recent_expenses(1)[0]["place"], "Кафе")
 
     def test_favorites_search_and_export(self):
         day = date(2026, 9, 24)
