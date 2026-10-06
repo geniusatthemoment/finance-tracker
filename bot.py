@@ -276,6 +276,35 @@ def init_db():
                 f"UPDATE {table} SET place = ? WHERE id = ?",
                 [(normalize_place(row["place"]), row["id"]) for row in rows],
             )
+        migration = "563057258_food_2026_09_26_855_place_osh"
+        if not connection.execute(
+            "SELECT 1 FROM data_migrations WHERE name = ?", (migration,)
+        ).fetchone():
+            targets = connection.execute(
+                """SELECT id FROM expenses WHERE chat_id = ? AND spent_on = ?
+                   AND category = 'Еда' AND place = '' AND amount_cents = 85500
+                   AND batch_id IS NULL""",
+                (563057258, "2026-09-26"),
+            ).fetchall()
+            if len(targets) == 1:
+                updated = connection.execute(
+                    "UPDATE expenses SET place = 'ОШ' WHERE id = ?",
+                    (targets[0]["id"],),
+                ).rowcount
+                connection.execute(
+                    "INSERT INTO data_migrations(name, applied_at, affected_rows) VALUES (?, ?, ?)",
+                    (migration, datetime.utcnow().isoformat(), updated),
+                )
+                print(f"One-time Osh place migration: {updated} expense(s)", flush=True)
+            elif targets:
+                print(
+                    f"Osh place migration skipped: {len(targets)} matching expenses (expected 1)",
+                    flush=True,
+                )
+            elif connection.execute(
+                "SELECT 1 FROM users WHERE chat_id = ?", (563057258,)
+            ).fetchone():
+                print("Osh place migration skipped: no matching expense", flush=True)
         migration = "563057258_transport_small_fares_to_bus_2026_09_30"
         if not connection.execute(
             "SELECT 1 FROM data_migrations WHERE name = ?", (migration,)
@@ -525,7 +554,8 @@ def normalize_category(category):
 
 
 def normalize_place(place):
-    return " ".join(place.split()).casefold().capitalize()
+    normalized = " ".join(place.split()).casefold()
+    return "ОШ" if normalized == "ош" else normalized.capitalize()
 
 
 def place_aliases(chat_id):

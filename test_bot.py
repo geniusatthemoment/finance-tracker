@@ -378,6 +378,71 @@ class StorageTest(unittest.TestCase):
             [("Транспорт", 20500), ("Автобус", 16100), ("Такси", 4000)],
         )
 
+    def test_one_time_osh_place_fix_targets_only_matching_purchase(self):
+        first_user, second_user = 563057258, 656675199
+        day = date(2026, 9, 26)
+        bot.save_expenses(first_user, [
+            ("Еда", "", "нужная", 85500),
+            ("Еда", "", "другая", 35500),
+            ("Еда", "Другое", "третья", 10000),
+        ], day)
+        bot.save_expenses(second_user, [("Еда", "", "чужая", 85500)], day)
+        bot.init_db()
+        with bot.db() as connection:
+            rows = connection.execute(
+                "SELECT chat_id, comment, place FROM expenses ORDER BY id"
+            ).fetchall()
+            applied = connection.execute(
+                "SELECT affected_rows FROM data_migrations WHERE name = ?",
+                ("563057258_food_2026_09_26_855_place_osh",),
+            ).fetchone()
+        self.assertEqual(
+            [(row["chat_id"], row["comment"], row["place"]) for row in rows],
+            [(first_user, "нужная", "ОШ"), (first_user, "другая", ""),
+             (first_user, "третья", "Другое"), (second_user, "чужая", "")],
+        )
+        self.assertEqual(applied["affected_rows"], 1)
+        bot.init_db()
+        self.assertEqual(bot.normalize_place("ош"), "ОШ")
+        bot.save_expenses(first_user, [("Еда", "", "позднее", 1000)], day)
+        bot.init_db()
+        with bot.db() as connection:
+            late = connection.execute(
+                "SELECT place FROM expenses WHERE comment = 'позднее'"
+            ).fetchone()
+        self.assertEqual(late["place"], "")
+
+    def test_osh_place_fix_skips_when_purchase_does_not_match(self):
+        first_user = 563057258
+        day = date(2026, 9, 26)
+        bot.save_expenses(first_user, [("Еда", "", "не та сумма", 50000)], day)
+        bot.init_db()
+        with bot.db() as connection:
+            row = connection.execute(
+                "SELECT place FROM expenses WHERE comment = 'не та сумма'"
+            ).fetchone()
+            applied = connection.execute(
+                "SELECT 1 FROM data_migrations WHERE name = ?",
+                ("563057258_food_2026_09_26_855_place_osh",),
+            ).fetchone()
+        self.assertEqual(row["place"], "")
+        self.assertIsNone(applied)
+
+    def test_osh_place_fix_skips_ambiguous_duplicate_purchases(self):
+        first_user = 563057258
+        day = date(2026, 9, 26)
+        bot.save_expenses(first_user, [
+            ("Еда", "", "первая", 85500),
+            ("Еда", "", "вторая", 85500),
+        ], day)
+        bot.init_db()
+        with bot.db() as connection:
+            places = connection.execute(
+                "SELECT place FROM expenses WHERE chat_id = ? ORDER BY id",
+                (first_user,),
+            ).fetchall()
+        self.assertEqual([row["place"] for row in places], ["", ""])
+
     def test_remaining_transport_becomes_taxi_once_for_first_user(self):
         first_user, second_user = 563057258, 656675199
         day = date(2026, 9, 29)
