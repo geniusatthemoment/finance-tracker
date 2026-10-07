@@ -1716,9 +1716,13 @@ def budget_snapshot(user, today):
     month_spent = spent(user["chat_id"], month_start, today)
     remaining = max(user["budget_cents"] - month_spent, 0)
     days_left = max((month_end - today).days + 1, 1)
-    daily = remaining // days_left
-    week_left = daily * ((week_end - today).days + 1)
-    return daily, week_left, remaining
+    spent_today = spent(user["chat_id"], today, today)
+    remaining_before_today = max(user["budget_cents"] - (month_spent - spent_today), 0)
+    daily_limit = remaining_before_today // days_left
+    today_left = max(daily_limit - spent_today, 0)
+    week_days_left = (week_end - today).days + 1
+    week_left = max(daily_limit * week_days_left - spent_today, 0)
+    return today_left, week_left, remaining
 
 
 def budget_snapshot_lines(user, today):

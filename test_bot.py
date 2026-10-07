@@ -928,6 +928,32 @@ class StorageTest(unittest.TestCase):
         self.assertIn("До конца месяца: 18 798 ₽", message)
         self.assertEqual(bot.budget_snapshot(user, date(2026, 10, 9))[1], 3 * bot.budget_snapshot(user, date(2026, 10, 9))[0])
 
+    def test_today_budget_subtracts_expenses_spent_today(self):
+        bot.ensure_user(1)
+        with bot.db() as connection:
+            connection.execute("UPDATE users SET budget_cents = ? WHERE chat_id = 1", (2500000,))
+        bot.save_expenses(1, [("Еда", "", 620200)], date(2026, 10, 5))
+        bot.save_expenses(1, [("Автобус", "", 8000)], date(2026, 10, 7))
+        user = bot.get_user(1)
+
+        self.assertEqual(bot.budget_snapshot(user, date(2026, 10, 7)), (67192, 367960, 1871800))
+        status = bot.budget_status_text(user, date(2026, 10, 7))
+        self.assertIn("Потрачено в этом месяце: 6 282 ₽", status)
+        self.assertIn("На сегодня: 671.92 ₽", status)
+        self.assertIn("На неделю осталось: 3 679.60 ₽", status)
+        self.assertIn("До конца месяца: 18 718 ₽", status)
+        self.assertIn("На сегодня: 671.92 ₽", bot.morning_text(user, date(2026, 10, 7)))
+
+    def test_today_budget_stops_at_zero_after_overspending_today(self):
+        bot.ensure_user(1)
+        with bot.db() as connection:
+            connection.execute("UPDATE users SET budget_cents = ? WHERE chat_id = 1", (2500000,))
+        bot.save_expenses(1, [("Еда", "", 200000)], date(2026, 10, 7))
+        today_left, week_left, month_left = bot.budget_snapshot(bot.get_user(1), date(2026, 10, 7))
+        self.assertEqual(today_left, 0)
+        self.assertGreaterEqual(week_left, 0)
+        self.assertEqual(month_left, 2300000)
+
     def test_week_budget_stops_at_month_end_and_recalculates_daily(self):
         bot.ensure_user(1)
         with bot.db() as connection:
