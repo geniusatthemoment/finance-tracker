@@ -224,6 +224,59 @@ class InvestmentsTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     inv.report_text(c, 1, "/forecast", arg, date(2026, 10, 1), api)
 
+    def test_pnl_compact_total_matches_profit_and_fees_not_subtracted_twice(self):
+        self.save(report(cash=[payment()]))
+        api = SimpleNamespace(all=lambda _: {ISIN: market()})
+        with self.db() as c:
+            text, keyboard = inv.report_text(c, 1, "/pnl", "", date(2026, 10, 1), api)
+        self.assertTrue(text.startswith("PNL по всем облигациям: 134.00 ₽"))
+        self.assertIn("Купоны: 60.00 ₽", text)
+        self.assertIn("Изменение стоимости с НКД: 74.00 ₽", text)
+        self.assertIn("Комиссии: 6.00 ₽ — уже вычтены", text)
+        self.assertNotIn("ISIN:", text)
+        self.assertIsNone(keyboard)
+        self.assertLess(len(text), 1000)
+
+    def test_pnl_negative_result(self):
+        self.save()
+        m = market()
+        m["price"] = 80
+        with self.db() as c:
+            text, _ = inv.report_text(c, 1, "/pnl", "", date(2026, 10, 1), SimpleNamespace(all=lambda _: {ISIN: m}))
+        self.assertTrue(text.startswith("PNL по всем облигациям: -286.00 ₽"))
+
+    def test_pnl_incomplete_history_never_presented_as_whole_portfolio(self):
+        r = report()
+        other = "RU000A10BS76"
+        r["bonds"][other] = dict(r["bonds"][ISIN], name="Нет истории", opening="2")
+        self.save(r)
+        with self.db() as c:
+            text, _ = inv.report_text(c, 1, "/pnl", "", date(2026, 10, 1), SimpleNamespace(all=lambda _: {ISIN: market(), other: market()}))
+        self.assertTrue(text.startswith("PNL по всем облигациям: нет полного расчёта"))
+        self.assertIn("PNL по учтённым выпускам (1/2): 74.00 ₽", text)
+        self.assertIn("Не учтены (нет истории покупки или котировки): Нет истории", text)
+
+    def test_pnl_unknown_cash_and_missing_prices(self):
+        p = payment()
+        p["regnumber"], p["comment"] = "UNKNOWN", "Unknown"
+        self.save(report(cash=[p]))
+        m = market()
+        with self.db() as c:
+            text, _ = inv.report_text(c, 1, "/pnl", "", date(2026, 10, 1), SimpleNamespace(all=lambda _: {ISIN: m}))
+            self.assertIn("нет полного расчёта", text)
+            self.assertIn("Не сопоставлено выплат: 1", text)
+            m["price"] = None
+            m["stale"] = True
+            text, _ = inv.report_text(c, 1, "/pnl", "", date(2026, 10, 1), SimpleNamespace(all=lambda _: {ISIN: m}))
+        self.assertIn("(0/1): нет данных", text)
+        self.assertIn("часть данных сохранённая", text)
+
+    def test_pnl_route_registered(self):
+        message = {"chat": {"id": 1}, "from": {"id": 1}, "text": "/pnl"}
+        with patch.object(bot, "ALLOWED_USER_IDS", {1}), patch.object(bot, "handle_investment_command") as handle:
+            bot.handle_message(message)
+            handle.assert_called_once()
+
     def test_bond_ambiguity_buttons(self):
         r = report()
         r["bonds"]["RU000A10BS76"] = dict(r["bonds"][ISIN], name="Тест 02", opening="0", quantity="0")

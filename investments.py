@@ -24,12 +24,13 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 ISS = "https://iss.moex.com/iss"
 MAX_FILE = 10_000_000
 ISIN_RE = re.compile(r"^[A-Z]{2}[A-Z0-9]{9}\d$")
-COMMANDS = {"/portfolio", "/profit", "/forecast", "/maturity", "/bond", "/payments", "/invest", "/invest_import"}
+COMMANDS = {"/portfolio", "/profit", "/pnl", "/forecast", "/maturity", "/bond", "/payments", "/invest", "/invest_import"}
 HELP = (
     "Инвестиции (отдельно от трат)\n"
     "Пришли брокерский XLSX Альфы с подписью /invest_import.\n"
     "Лучше с открытия счёта: повторные и пересекающиеся отчёты не дублируются.\n\n"
     "/portfolio — облигации и текущая стоимость\n"
+    "/pnl — короткий общий результат по всем облигациям сейчас\n"
     "/profit — полученные купоны, реализованный и текущий результат\n"
     "/forecast 31.12.2026 — выплаты и купонный доход к дате\n"
     "/maturity — итог при удержании до погашения\n"
@@ -484,6 +485,43 @@ def forecast(bond, market, asof, target):
             "earned": earned, "maturity": maturity}
 
 
+def pnl_text(state, markets, cash, unmatched):
+    """Same cash-flow PNL as /profit, with a compact and explicit coverage scope."""
+    calculated, missing = [], []
+    for isin, bond in state["bonds"].items():
+        result = results(bond, markets[isin], cash[isin])
+        if result["total"] is None:
+            missing.append(bond["name"])
+        else:
+            calculated.append(result)
+    complete = not missing and not unmatched
+    total = sum((r["total"] for r in calculated), Decimal(0)) if calculated else None
+    lines = [f"PNL по всем облигациям: {rub(total) if complete else 'нет полного расчёта'}"]
+    if not complete:
+        lines.append(f"PNL по учтённым выпускам ({len(calculated)}/{len(state['bonds'])}): {rub(total)}")
+    if calculated:
+        coupons = sum((r["coupons"] for r in calculated), Decimal(0))
+        realized = sum((r["realized"] for r in calculated), Decimal(0)) if all(r["realized"] is not None for r in calculated) else None
+        unrealized = sum((r["unrealized"] for r in calculated), Decimal(0)) if all(r["unrealized"] is not None for r in calculated) else None
+        fees = sum((r["fees"] for r in calculated), Decimal(0))
+        if not complete:
+            lines.append("Разбивка только по учтённым выпускам:")
+        lines.extend([f"Купоны: {rub(coupons)}", f"Результат закрытых сделок: {rub(realized)}",
+                      f"Изменение стоимости с НКД: {rub(unrealized)}", f"Комиссии: {rub(fees)} — уже вычтены из PNL"])
+    if missing:
+        lines.append("Не учтены (нет истории покупки или котировки): " + ", ".join(missing))
+    if unmatched:
+        lines.append(f"Не сопоставлено выплат: {len(unmatched)}. Полный PNL недоступен.")
+    quote_dates = sorted({m["quote_at"] for isin, m in markets.items() if m["quote_at"] and dec(state["bonds"][isin]["quantity"]) > 0})
+    if quote_dates:
+        lines.append("Котировки: " + (quote_dates[0] if len(quote_dates) == 1 else f"{quote_dates[0]} — {quote_dates[-1]}"))
+    if any(m["stale"] for m in markets.values()):
+        lines.append("MOEX не обновился: часть данных сохранённая.")
+    lines.append(f"Сделки и купоны по отчёту на {state['asof']:%d.%m.%Y}. Без налогов.")
+    lines.append("Текущая стоимость — оценка MOEX, не сумма гарантированной продажи.")
+    return "\n".join(lines)
+
+
 def report_text(connection, chat_id, command, argument, today, market):
     state = portfolio(connection, chat_id)
     if not state:
@@ -504,6 +542,8 @@ def report_text(connection, chat_id, command, argument, today, market):
         bonds = {matches[0]: bonds[matches[0]]}
     markets = market.all(list(state["bonds"]))
     cash, unmatched = cash_by_bond(state, markets)
+    if command == "/pnl":
+        return pnl_text(state, markets, cash, unmatched), None
     lines = [f"Облигации · отчёт по {state['asof']:%d.%m.%Y}"]
     if state["asof"] < today:
         lines.append("Сделки и поступления после этой даты не подтверждены. Обнови XLSX после новых операций.")
