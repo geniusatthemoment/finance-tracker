@@ -229,12 +229,12 @@ class InvestmentsTest(unittest.TestCase):
         api = SimpleNamespace(all=lambda _: {ISIN: market()})
         with self.db() as c:
             text, keyboard = inv.report_text(c, 1, "/pnl", "", date(2026, 10, 1), api)
-        self.assertTrue(text.startswith("PNL по всем облигациям: 134.00 ₽"))
-        self.assertIn("Купоны: 60.00 ₽", text)
-        self.assertIn("Изменение стоимости с НКД: 74.00 ₽", text)
+        self.assertTrue(text.startswith("Твой результат: 134.00 ₽"))
+        self.assertIn("Получено купонов: 60.00 ₽", text)
+        self.assertIn("Изменение стоимости оставшихся: 74.00 ₽", text)
         self.assertIn("Комиссии: 6.00 ₽ — уже вычтены", text)
         self.assertNotIn("ISIN:", text)
-        self.assertIsNone(keyboard)
+        self.assertEqual(keyboard['inline_keyboard'][0][0]['callback_data'], 'investdetail:profit:')
         self.assertLess(len(text), 1000)
 
     def test_pnl_negative_result(self):
@@ -243,7 +243,7 @@ class InvestmentsTest(unittest.TestCase):
         m["price"] = 80
         with self.db() as c:
             text, _ = inv.report_text(c, 1, "/pnl", "", date(2026, 10, 1), SimpleNamespace(all=lambda _: {ISIN: m}))
-        self.assertTrue(text.startswith("PNL по всем облигациям: -286.00 ₽"))
+        self.assertTrue(text.startswith("Твой результат: -286.00 ₽"))
 
     def test_pnl_incomplete_history_never_presented_as_whole_portfolio(self):
         r = report()
@@ -252,9 +252,9 @@ class InvestmentsTest(unittest.TestCase):
         self.save(r)
         with self.db() as c:
             text, _ = inv.report_text(c, 1, "/pnl", "", date(2026, 10, 1), SimpleNamespace(all=lambda _: {ISIN: market(), other: market()}))
-        self.assertTrue(text.startswith("PNL по всем облигациям: нет полного расчёта"))
-        self.assertIn("PNL по учтённым выпускам (1/2): 74.00 ₽", text)
-        self.assertIn("Не учтены (нет истории покупки или котировки): Нет истории", text)
+        self.assertTrue(text.startswith("Твой результат: пока не могу посчитать всё"))
+        self.assertIn("По 1 из 2 облигаций: 74.00 ₽", text)
+        self.assertIn("Не хватает истории или цены: Нет истории", text)
 
     def test_pnl_unknown_cash_and_missing_prices(self):
         p = payment()
@@ -263,12 +263,12 @@ class InvestmentsTest(unittest.TestCase):
         m = market()
         with self.db() as c:
             text, _ = inv.report_text(c, 1, "/pnl", "", date(2026, 10, 1), SimpleNamespace(all=lambda _: {ISIN: m}))
-            self.assertIn("нет полного расчёта", text)
+            self.assertIn("пока не могу посчитать всё", text)
             self.assertIn("Не сопоставлено выплат: 1", text)
             m["price"] = None
             m["stale"] = True
             text, _ = inv.report_text(c, 1, "/pnl", "", date(2026, 10, 1), SimpleNamespace(all=lambda _: {ISIN: m}))
-        self.assertIn("(0/1): нет данных", text)
+        self.assertIn("По 0 из 1 облигаций: нет данных", text)
         self.assertIn("часть данных сохранённая", text)
 
     def test_pnl_route_registered(self):
@@ -276,6 +276,52 @@ class InvestmentsTest(unittest.TestCase):
         with patch.object(bot, "ALLOWED_USER_IDS", {1}), patch.object(bot, "handle_investment_command") as handle:
             bot.handle_message(message)
             handle.assert_called_once()
+
+    def test_plain_commands_do_not_intercept_expenses(self):
+        self.assertEqual(inv.command_text('СКОЛЬКО ЗАРАБОТАЛ'), '/pnl')
+        self.assertEqual(inv.command_text('до 31.12.2026'), '/forecast 31.12.2026')
+        self.assertEqual(inv.command_text('/PNL'), '/pnl')
+        self.assertIsNone(inv.command_text('облигации 500'))
+        self.assertIsNone(inv.command_text('еда кафе 500'))
+
+    def test_compact_reports_keep_details_available(self):
+        self.save(report(cash=[payment()]))
+        api = SimpleNamespace(all=lambda _: {ISIN: market()})
+        with self.db() as c:
+            for command, argument in [('/portfolio', ''), ('/forecast', '31.12.2026'), ('/maturity', ''), ('/payments', '')]:
+                text, keyboard = inv.report_text(c, 1, command, argument, date(2026, 10, 1), api)
+                self.assertIsNotNone(keyboard)
+                self.assertNotIn('ISIN:', text)
+                self.assertLess(len(text), 1500)
+            text, _ = inv.report_text(c, 1, '/profit', '', date(2026, 10, 1), api, detailed=True)
+            self.assertIn('ISIN:', text)
+
+    def test_calculation_runs_in_background_and_rejects_duplicate(self):
+        with patch.object(bot, 'send') as send, patch.object(bot.INVESTMENT_WORKERS, 'submit') as submit:
+            try:
+                bot.handle_investment_command(1, '/pnl', {'timezone': 'Asia/Tomsk'})
+                bot.handle_investment_command(1, '/pnl', {'timezone': 'Asia/Tomsk'})
+                self.assertEqual(submit.call_count, 1)
+                self.assertEqual(send.call_args_list[0].args[1], 'Считаю…')
+                self.assertIn('Уже считаю', send.call_args_list[1].args[1])
+            finally:
+                bot.INVESTMENT_PENDING.discard(1)
+
+    def test_worker_failure_responds_and_releases_user(self):
+        bot.INVESTMENT_PENDING.add(1)
+        with patch.object(inv, 'report_text', side_effect=RuntimeError('private')), patch.object(bot, 'send') as send:
+            bot.investment_worker(1, '/pnl', '', date(2026, 10, 11), False)
+            self.assertIn('Не получилось', send.call_args.args[1])
+        self.assertNotIn(1, bot.INVESTMENT_PENDING)
+
+    def test_detail_callback_and_date_prompt(self):
+        c = {'id': 'q', 'from': {'id': 1}, 'message': {'chat': {'id': 1, 'type': 'private'}}, 'data': 'investdetail:profit:'}
+        with patch.object(bot, 'ALLOWED_USER_IDS', {1}), patch.object(bot, 'api'), patch.object(bot, 'handle_investment_command') as handle, patch.object(bot, 'send') as send:
+            bot.handle_callback(c)
+            self.assertTrue(handle.call_args.kwargs['detailed'])
+            c['data'] = 'investcmd:forecast'
+            bot.handle_callback(c)
+            self.assertIn('до 31.12.2026', send.call_args.args[1])
 
     def test_bond_ambiguity_buttons(self):
         r = report()

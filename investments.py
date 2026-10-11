@@ -26,19 +26,39 @@ MAX_FILE = 10_000_000
 ISIN_RE = re.compile(r"^[A-Z]{2}[A-Z0-9]{9}\d$")
 COMMANDS = {"/portfolio", "/profit", "/pnl", "/forecast", "/maturity", "/bond", "/payments", "/invest", "/invest_import"}
 HELP = (
-    "Инвестиции (отдельно от трат)\n"
-    "Пришли брокерский XLSX Альфы с подписью /invest_import.\n"
-    "Лучше с открытия счёта: повторные и пересекающиеся отчёты не дублируются.\n\n"
-    "/portfolio — облигации и текущая стоимость\n"
-    "/pnl — короткий общий результат по всем облигациям сейчас\n"
-    "/profit — полученные купоны, реализованный и текущий результат\n"
-    "/forecast 31.12.2026 — выплаты и купонный доход к дате\n"
-    "/maturity — итог при удержании до погашения\n"
-    "/bond Брусника — выпуск и история покупок\n"
-    "/payments — ближайшие выплаты (90 дней)\n\n"
-    "Цены: MOEX ISS, с задержкой. Налоги не учитываются.\n"
-    "После новых сделок/выплат загрузи свежий отчёт."
+    "Твои облигации\n\n"
+    "/pnl — сколько заработал или потерял\n"
+    "/portfolio — что у тебя куплено\n"
+    "/forecast 31.12.2026 — сколько получишь к дате\n"
+    "/maturity — сколько заработаешь до погашения\n"
+    "/payments — когда ближайшие выплаты\n"
+    "/bond Брусника — подробнее об облигации\n\n"
+    "Можно просто написать «сколько заработал», «мои облигации» или «до 31.12.2026».\n"
+    "Новый отчёт: пришли XLSX с подписью /invest_import. Налоги не считаем."
 )
+MENU = {"inline_keyboard": [
+    [{"text": "Сколько заработал", "callback_data": "investcmd:pnl"}],
+    [{"text": "Мои облигации", "callback_data": "investcmd:portfolio"}],
+    [{"text": "До погашения", "callback_data": "investcmd:maturity"},
+     {"text": "Ближайшие выплаты", "callback_data": "investcmd:payments"}],
+    [{"text": "До какой даты?", "callback_data": "investcmd:forecast"}],
+]}
+
+
+def command_text(text):
+    """Plain Russian shortcuts, without intercepting valid expense entries."""
+    normalized = text.strip().casefold()
+    aliases = {"облигации": "/invest", "мои облигации": "/portfolio", "сколько заработал": "/pnl",
+               "прибыль по облигациям": "/pnl", "до погашения": "/maturity", "ближайшие выплаты": "/payments"}
+    if normalized in aliases:
+        return aliases[normalized]
+    match = re.fullmatch(r"(?:до|прогноз)\s+(\d{1,2}\.\d{1,2}\.\d{4})", normalized)
+    if match:
+        return "/forecast " + match[1]
+    parts = text.split(maxsplit=1)
+    if parts and parts[0].lower() in COMMANDS:
+        return parts[0].lower() + (" " + parts[1] if len(parts) > 1 else "")
+    return None
 
 
 def init_db(connection):
@@ -264,7 +284,12 @@ def bootstrap(connection, encoded, allowed_users):
     chat_id = int(payload["chat_id"])
     if chat_id not in allowed_users:
         raise ValueError("Bootstrap user is not on the allowlist")
-    return save_report(connection, chat_id, payload["sha256"], payload["report"])
+    imported = save_report(connection, chat_id, payload["sha256"], payload["report"])
+    for cached in payload.get("market_cache", []):
+        connection.execute("""INSERT INTO investment_market_cache VALUES (?, ?, ?)
+            ON CONFLICT(cache_key) DO UPDATE SET fetched_at=excluded.fetched_at, data=excluded.data
+            WHERE excluded.fetched_at > investment_market_cache.fetched_at""", cached)
+    return imported
 
 
 def portfolio(connection, chat_id):
@@ -496,20 +521,20 @@ def pnl_text(state, markets, cash, unmatched):
             calculated.append(result)
     complete = not missing and not unmatched
     total = sum((r["total"] for r in calculated), Decimal(0)) if calculated else None
-    lines = [f"PNL по всем облигациям: {rub(total) if complete else 'нет полного расчёта'}"]
+    lines = [f"Твой результат: {rub(total) if complete else 'пока не могу посчитать всё'}"]
     if not complete:
-        lines.append(f"PNL по учтённым выпускам ({len(calculated)}/{len(state['bonds'])}): {rub(total)}")
+        lines.append(f"По {len(calculated)} из {len(state['bonds'])} облигаций: {rub(total)}")
     if calculated:
         coupons = sum((r["coupons"] for r in calculated), Decimal(0))
         realized = sum((r["realized"] for r in calculated), Decimal(0)) if all(r["realized"] is not None for r in calculated) else None
         unrealized = sum((r["unrealized"] for r in calculated), Decimal(0)) if all(r["unrealized"] is not None for r in calculated) else None
         fees = sum((r["fees"] for r in calculated), Decimal(0))
         if not complete:
-            lines.append("Разбивка только по учтённым выпускам:")
-        lines.extend([f"Купоны: {rub(coupons)}", f"Результат закрытых сделок: {rub(realized)}",
-                      f"Изменение стоимости с НКД: {rub(unrealized)}", f"Комиссии: {rub(fees)} — уже вычтены из PNL"])
+            lines.append("Из чего состоит эта сумма:")
+        lines.extend([f"Получено купонов: {rub(coupons)}", f"Заработано на продаже: {rub(realized)}",
+                      f"Изменение стоимости оставшихся: {rub(unrealized)}", f"Комиссии: {rub(fees)} — уже вычтены"])
     if missing:
-        lines.append("Не учтены (нет истории покупки или котировки): " + ", ".join(missing))
+        lines.append("Не хватает истории или цены: " + ", ".join(missing))
     if unmatched:
         lines.append(f"Не сопоставлено выплат: {len(unmatched)}. Полный PNL недоступен.")
     quote_dates = sorted({m["quote_at"] for isin, m in markets.items() if m["quote_at"] and dec(state["bonds"][isin]["quantity"]) > 0})
@@ -518,11 +543,69 @@ def pnl_text(state, markets, cash, unmatched):
     if any(m["stale"] for m in markets.values()):
         lines.append("MOEX не обновился: часть данных сохранённая.")
     lines.append(f"Сделки и купоны по отчёту на {state['asof']:%d.%m.%Y}. Без налогов.")
-    lines.append("Текущая стоимость — оценка MOEX, не сумма гарантированной продажи.")
+    lines.append("Накопленные проценты учтены. Цена продажи может отличаться.")
     return "\n".join(lines)
 
 
-def report_text(connection, chat_id, command, argument, today, market):
+def simple_report(state, markets, cash, unmatched, command, target, today):
+    """One main answer, with per-bond detail kept behind a button."""
+    if command == "/portfolio":
+        values = [results(b, markets[i], cash[i])["value"] for i, b in state["bonds"].items()]
+        total = sum(values, Decimal(0)) if all(v is not None for v in values) else None
+        lines = [f"Твои облигации сейчас: {rub(total)}", ""]
+        lines.extend(f"• {b['name']} — {dec(b['quantity']):g} шт., {rub(v)}" for b, v in zip(state["bonds"].values(), values))
+        keyboard = {"inline_keyboard": [[{"text": b["name"], "callback_data": "investbond:" + i}] for i, b in state["bonds"].items()]}
+    else:
+        forecasts, gains, entries, issues = [], [], [], []
+        for isin, bond in state["bonds"].items():
+            if dec(bond["quantity"]) == 0:
+                continue
+            m = markets[isin]
+            maturity = m["security"].get("MATDATE") or m["description"].get("MATDATE")
+            end = day(maturity) if command == "/maturity" and maturity and maturity != "0000-00-00" else target
+            f = forecast(bond, m, state["asof"], end)
+            forecasts.append(f)
+            r = results(bond, m, cash[isin])
+            gains.append(r["net_trades"] + r["coupons"] + r["principal"] + f["coupons"] + f["principal"] if r["complete"] and not f["unknown"] and f["maturity"] else None)
+            if f["unknown"]:
+                issues.append(bond["name"])
+            entries.extend((e["day"], bond["name"], e["kind"], e["amount"]) for e in f["entries"] if e["day"] > today)
+        coupons = sum((f["coupons"] for f in forecasts), Decimal(0))
+        principal = sum((f["principal"] for f in forecasts), Decimal(0))
+        if command == "/payments":
+            lines = ["Ближайшие выплаты (90 дней)", ""]
+            lines.extend(f"• {when:%d.%m}: {rub(value)} — {name}{' (возврат вложенных денег)' if kind == 'principal' else ''}" for when, name, kind, value in sorted(entries))
+            if not entries:
+                lines.append("Известных выплат пока нет.")
+        elif command == "/forecast":
+            earned = sum((f["earned"] for f in forecasts), Decimal(0)) if all(f["earned"] is not None for f in forecasts) else None
+            lines = [f"До {target:%d.%m.%Y} получишь по известному графику: {rub(coupons + principal)}", "",
+                     f"Купоны: {rub(coupons)}", f"Возврат вложенных денег: {rub(principal)}",
+                     f"Купонный доход за этот период: {rub(earned)}",
+                     "Будущую цену облигаций не угадываем."]
+        else:
+            complete = all(v is not None for v in gains) and not unmatched
+            known = [v for v in gains if v is not None]
+            total = sum(known, Decimal(0)) if known else None
+            lines = [f"До погашения заработаешь: {rub(total) if complete else 'полная сумма пока неизвестна'}", "",
+                     f"Ещё получишь купонов по известному графику: {rub(coupons)}",
+                     f"Вернётся вложенных денег: {rub(principal)}"]
+            if not complete:
+                lines.append(f"Прибыль по {len(known)} из {len(gains)} выпусков с полными данными: {rub(total)}")
+        if issues:
+            lines.append("\nНе все будущие выплаты известны или есть оферта: " + ", ".join(issues))
+        if command in ("/forecast", "/maturity"):
+            lines.append(f"Считаем выплаты после отчёта от {state['asof']:%d.%m.%Y}; прошедшие даты ещё не подтверждены отчётом.")
+        keyboard = {"inline_keyboard": [[{"text": "Подробнее по каждой облигации", "callback_data": f"investdetail:{command[1:]}:{target.isoformat()}"}]]} if command != "/payments" else MENU
+    if any(m["stale"] or m["schedule_stale"] for m in markets.values()):
+        lines.append("MOEX не обновился: показываю сохранённые данные.")
+    if unmatched:
+        lines.append("Не все прошлые выплаты сопоставлены с облигациями. Подробнее: /profit.")
+    lines.append(f"Отчёт на {state['asof']:%d.%m.%Y}. Без налогов; выплаты по графику не гарантированы.")
+    return "\n".join(lines), keyboard
+
+
+def report_text(connection, chat_id, command, argument, today, market, detailed=False):
     state = portfolio(connection, chat_id)
     if not state:
         return HELP, None
@@ -542,8 +625,10 @@ def report_text(connection, chat_id, command, argument, today, market):
         bonds = {matches[0]: bonds[matches[0]]}
     markets = market.all(list(state["bonds"]))
     cash, unmatched = cash_by_bond(state, markets)
-    if command == "/pnl":
-        return pnl_text(state, markets, cash, unmatched), None
+    if command == "/pnl" or (command == "/profit" and not detailed):
+        return pnl_text(state, markets, cash, unmatched), {"inline_keyboard": [[{"text": "Подробнее по каждой облигации", "callback_data": "investdetail:profit:"}]]}
+    if not detailed and command in ("/portfolio", "/forecast", "/maturity", "/payments"):
+        return simple_report(state, markets, cash, unmatched, command, target, today)
     lines = [f"Облигации · отчёт по {state['asof']:%d.%m.%Y}"]
     if state["asof"] < today:
         lines.append("Сделки и поступления после этой даты не подтверждены. Обнови XLSX после новых операций.")

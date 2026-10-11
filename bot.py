@@ -15,6 +15,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
@@ -1765,19 +1767,50 @@ def handle_investment_document(chat_id, document):
         send(chat_id, "Не удалось обработать XLSX. Проверь, что это брокерский отчёт Альфы.")
 
 
-def handle_investment_command(chat_id, text, user):
-    command, _, argument = text.partition(" ")
-    if command in ("/invest", "/invest_import"):
-        send(chat_id, investments.HELP)
-        return
+INVESTMENT_WORKERS = ThreadPoolExecutor(max_workers=2)
+INVESTMENT_PENDING = set()
+INVESTMENT_LOCK = threading.Lock()
+
+
+def investment_worker(chat_id, command, argument, today, detailed):
+    started = time.monotonic()
+    print("Investment calculation started:", command, flush=True)
     try:
         with db() as connection:
             result, keyboard = investments.report_text(
-                connection, chat_id, command, argument.strip(), user_calendar_today(user), investments.Market(db)
+                connection, chat_id, command, argument, today, investments.Market(db), detailed=detailed
             )
         send_investment_text(chat_id, result, keyboard)
     except ValueError as error:
         send(chat_id, str(error))
+    except Exception as error:
+        print("Investment calculation failed:", type(error).__name__, flush=True)
+        send(chat_id, "Не получилось посчитать облигации. Попробуй ещё раз чуть позже.")
+    finally:
+        with INVESTMENT_LOCK:
+            INVESTMENT_PENDING.discard(chat_id)
+        print("Investment calculation finished:", command, round(time.monotonic() - started, 1), flush=True)
+
+
+def handle_investment_command(chat_id, text, user, detailed=False):
+    command, _, argument = text.partition(" ")
+    if command in ("/invest", "/invest_import"):
+        send(chat_id, investments.HELP, investments.MENU)
+        return
+    with INVESTMENT_LOCK:
+        busy = chat_id in INVESTMENT_PENDING
+        if not busy:
+            INVESTMENT_PENDING.add(chat_id)
+    if busy:
+        send(chat_id, "Уже считаю твои облигации — ответ скоро придёт.")
+        return
+    try:
+        send(chat_id, "Считаю…")
+        INVESTMENT_WORKERS.submit(investment_worker, chat_id, command, argument.strip(), user_calendar_today(user), detailed)
+    except Exception:
+        with INVESTMENT_LOCK:
+            INVESTMENT_PENDING.discard(chat_id)
+        raise
 
 
 def budget_snapshot(user, today):
@@ -2024,10 +2057,11 @@ def handle_message(message):
             send(chat_id, "CSV: подпись /import. Брокерский XLSX: подпись /invest_import.")
         return
 
-    if text.split(" ", 1)[0] in investments.COMMANDS:
+    investment_text = investments.command_text(text)
+    if investment_text:
         if message["chat"].get("type", "private") != "private":
             return
-        handle_investment_command(chat_id, text, user)
+        handle_investment_command(chat_id, investment_text, user)
         return
 
     if text in ("/start", "/help"):
@@ -2561,7 +2595,25 @@ def handle_callback(callback):
     ensure_user(chat_id)
     user = get_user(chat_id)
     data = callback.get("data", "")
-    if data.startswith("investbond:"):
+    if data.startswith(("investcmd:", "investdetail:")):
+        if callback["message"]["chat"].get("type", "private") != "private":
+            return
+        api("answerCallbackQuery", callback_query_id=callback["id"])
+        parts = data.split(":", 2)
+        command = "/" + parts[1]
+        if command not in investments.COMMANDS:
+            return
+        argument = ""
+        if command == "/forecast" and len(parts) < 3:
+            send(chat_id, "Напиши дату, например: до 31.12.2026")
+            return
+        if len(parts) == 3 and parts[2]:
+            try:
+                argument = date.fromisoformat(parts[2]).strftime("%d.%m.%Y")
+            except ValueError:
+                return
+        handle_investment_command(chat_id, command + " " + argument, user, detailed=parts[0] == "investdetail")
+    elif data.startswith("investbond:"):
         if callback["message"]["chat"].get("type", "private") != "private":
             return
         api("answerCallbackQuery", callback_query_id=callback["id"])
