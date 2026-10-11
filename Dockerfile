@@ -5,7 +5,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY bot.py /app/bot.py
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+COPY bot.py investments.py /app/
 RUN mkdir -p /data
 
 ENV PYTHONUNBUFFERED=1 \

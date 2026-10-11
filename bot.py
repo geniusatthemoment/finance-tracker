@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A deliberately small Telegram expense tracker with no AI or dependencies."""
+"""A small Telegram expense tracker with an optional bond portfolio, no AI."""
 
 import calendar
 import csv
@@ -18,6 +18,8 @@ import uuid
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
+
+import investments
 
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -80,6 +82,9 @@ def db():
 
 def init_db():
     with db() as connection:
+        investments.init_db(connection)
+        if investments.bootstrap(connection, os.environ.get("INVESTMENT_BOOTSTRAP_GZIP_BASE64", ""), ALLOWED_USER_IDS):
+            print("Initial investment report imported; expense ledger unchanged")
         connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -1708,6 +1713,73 @@ def handle_import_document(chat_id, document):
     send(chat_id, f"Импортировал {count} записей." if count else "Этот CSV уже импортирован — повторно не добавляю.")
 
 
+def send_investment_text(chat_id, text, reply_markup=None):
+    # Bond histories/calendar can exceed Telegram's 4096 character limit.
+    chunks, current = [], ""
+    for line in text.splitlines():
+        while len(line) > 3500:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(line[:3500])
+            line = line[3500:]
+        if len(current) + len(line) + 1 > 3500:
+            chunks.append(current)
+            current = ""
+        current += ("\n" if current else "") + line
+    if current:
+        chunks.append(current)
+    for i, chunk in enumerate(chunks):
+        send(chat_id, chunk, reply_markup if i == len(chunks) - 1 else None)
+
+
+def handle_investment_document(chat_id, document):
+    if not document.get("file_name", "").lower().endswith(".xlsx"):
+        send(chat_id, "Пришли брокерский XLSX Альфы с подписью /invest_import.")
+        return
+    if document.get("file_size", 0) > investments.MAX_FILE:
+        send(chat_id, "XLSX слишком большой (максимум 10 МБ).")
+        return
+    info = api("getFile", file_id=document["file_id"])
+    if not info or not info.get("file_path"):
+        send(chat_id, "Не удалось скачать XLSX. Попробуй ещё раз.")
+        return
+    path = urllib.parse.quote(info["file_path"], safe="/")
+    try:
+        with urllib.request.urlopen(f"https://api.telegram.org/file/bot{TOKEN}/{path}", timeout=35) as response:
+            content = response.read(investments.MAX_FILE + 1)
+        with db() as connection:
+            report = investments.import_report(connection, chat_id, content)
+        if report is None:
+            send(chat_id, "Этот брокерский отчёт уже импортирован. Дубликатов нет.")
+            return
+        send(chat_id, f"Отчёт по {investments.day(report['end']):%d.%m.%Y} сохранён. Выпусков: {len(report['bonds'])}. Траты не изменены.\nЗагружаю данные MOEX…")
+        handle_investment_command(chat_id, "/portfolio", get_user(chat_id))
+    except (urllib.error.URLError, TimeoutError):
+        send(chat_id, "Не удалось скачать XLSX. Попробуй ещё раз.")
+    except ValueError as error:
+        send(chat_id, str(error))
+    except Exception as error:
+        # Never log file contents, credentials or a token-containing download URL.
+        print("Investment import failed:", type(error).__name__, file=sys.stderr)
+        send(chat_id, "Не удалось обработать XLSX. Проверь, что это брокерский отчёт Альфы.")
+
+
+def handle_investment_command(chat_id, text, user):
+    command, _, argument = text.partition(" ")
+    if command in ("/invest", "/invest_import"):
+        send(chat_id, investments.HELP)
+        return
+    try:
+        with db() as connection:
+            result, keyboard = investments.report_text(
+                connection, chat_id, command, argument.strip(), user_calendar_today(user), investments.Market(db)
+            )
+        send_investment_text(chat_id, result, keyboard)
+    except ValueError as error:
+        send(chat_id, str(error))
+
+
 def budget_snapshot(user, today):
     month_start = today.replace(day=1)
     days_in_month = calendar.monthrange(today.year, today.month)[1]
@@ -1915,6 +1987,7 @@ def help_text():
         "/settings — время и часовой пояс\n"
         "/undo — удалить последнюю запись\n"
         "/zero — сегодня без трат\n"
+        "/invest — облигации, прибыль, прогноз и импорт брокерского XLSX\n"
         "/help — эта подсказка"
     )
 
@@ -1940,10 +2013,20 @@ def handle_message(message):
     user = get_user(chat_id)
 
     if message.get("document"):
-        if text == "/import":
+        if text == "/invest_import" or (text == "/import" and message["document"].get("file_name", "").lower().endswith(".xlsx")):
+            if message["chat"].get("type", "private") != "private":
+                return
+            handle_investment_document(chat_id, message["document"])
+        elif text == "/import":
             handle_import_document(chat_id, message["document"])
         else:
-            send(chat_id, "Чтобы импортировать CSV, пришли файл с подписью /import.")
+            send(chat_id, "CSV: подпись /import. Брокерский XLSX: подпись /invest_import.")
+        return
+
+    if text.split(" ", 1)[0] in investments.COMMANDS:
+        if message["chat"].get("type", "private") != "private":
+            return
+        handle_investment_command(chat_id, text, user)
         return
 
     if text in ("/start", "/help"):
@@ -2477,7 +2560,12 @@ def handle_callback(callback):
     ensure_user(chat_id)
     user = get_user(chat_id)
     data = callback.get("data", "")
-    if data.startswith("zero:"):
+    if data.startswith("investbond:"):
+        if callback["message"]["chat"].get("type", "private") != "private":
+            return
+        api("answerCallbackQuery", callback_query_id=callback["id"])
+        handle_investment_command(chat_id, "/bond " + data.split(":", 1)[1], user)
+    elif data.startswith("zero:"):
         day = date.fromisoformat(data.split(":", 1)[1])
         mark_zero(chat_id, day)
         api("answerCallbackQuery", callback_query_id=callback["id"], text="Отметил")
