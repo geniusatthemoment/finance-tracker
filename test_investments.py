@@ -134,6 +134,35 @@ class InvestmentsTest(unittest.TestCase):
         self.assertEqual(r["coupons"], Decimal(60))
         self.assertEqual(r["value"], Decimal(2970))
 
+    def test_price_coupons_accrual_and_fees_reconcile(self):
+        for trades, qty, cash in [([trade()], '2', [payment()]), ([trade(), trade(qty='-1', amount='1000', nkd='10', fee='3', identity='2')], '1', [payment()])]:
+            with self.db() as c:
+                c.execute('DELETE FROM investment_reports')
+                inv.save_report(c, 1, 'x', report(qty=qty, trades=trades, cash=cash))
+            v = inv.results(self.state()['bonds'][ISIN], market(), cash)
+            self.assertEqual(v['total'], v['price_result'] + v['coupons'] + v['accrued_result'] - v['fees'])
+
+    def test_full_redemption_reconciles_without_current_quote(self):
+        self.save(report(qty='0', end='2026-12-31'))
+        m = market(); m['price'] = None
+        cash = [payment(kind='principal', amount='2000', when='2026-12-31'), payment()]
+        v = inv.results(self.state()['bonds'][ISIN], m, cash)
+        self.assertEqual(v['total'], Decimal('154'))
+        self.assertEqual(v['price_result'], Decimal('120'))
+        self.assertEqual(v['accrued_result'], Decimal('-20'))
+        self.assertEqual(v['total'], v['price_result'] + v['coupons'] + v['accrued_result'] - v['fees'])
+        cash[0]['amount'] = '1000'
+        self.assertIsNone(inv.results(self.state()['bonds'][ISIN], m, cash)['total'])
+
+    def test_reimport_repaired_parser_keeps_existing_trades(self):
+        self.save()
+        updated = report()
+        updated['bonds']['RU000A106HB4'] = {'name': 'ВУШ БО', 'opening': '0', 'quantity': '0', 'reported_value': '0'}
+        with self.db() as c:
+            self.assertTrue(inv.save_report(c, 1, 'first', updated))
+            self.assertEqual(c.execute('SELECT COUNT(*) FROM investment_reports').fetchone()[0], 1)
+            self.assertFalse(inv.save_report(c, 1, 'first', updated))
+
     def test_missing_price_not_zero(self):
         self.save()
         m = market()
@@ -231,8 +260,8 @@ class InvestmentsTest(unittest.TestCase):
             text, keyboard = inv.report_text(c, 1, "/pnl", "", date(2026, 10, 1), api)
         self.assertTrue(text.startswith("Твой результат: 134.00 ₽"))
         self.assertIn("Получено купонов: 60.00 ₽", text)
-        self.assertIn("Изменение стоимости оставшихся: 74.00 ₽", text)
-        self.assertIn("Комиссии: 6.00 ₽ — уже вычтены", text)
+        self.assertIn("Изменение цены бумаг: 80.00 ₽", text)
+        self.assertIn("Потеряно на комиссиях: 6.00 ₽", text)
         self.assertNotIn("ISIN:", text)
         self.assertEqual(keyboard['inline_keyboard'][0][0]['callback_data'], 'investdetail:profit:')
         self.assertLess(len(text), 1000)
@@ -389,12 +418,15 @@ class ParserTest(unittest.TestCase):
         positions = [row(c9="01.09.2026 - 30.09.2026", c20="№ 123 от 01.01.2026")]
         positions += [row(c2="Инструмент", c6="Актив ¹", c12="кол-во, шт.", c14="стоимость², руб.", c15="кол-во, шт.", c17="стоимость², руб.")]
         positions += [row(c2="Облигации", c6="Тест 01", c12=0, c14=0, c15=2, c17=2000), row(c6=ISIN), ()]
-        header = row(c4="№ сделки", c7="Дата\nзаключен.", c10="Дата\nрасчетов", c12="ISIN/рег.код", c16="Количество актива⁷", c19="Сумма сделки", c21="В т.ч. НКД", c23="Валюта расчетов", c24="Комиссия\nбанка", c28="Коммент.")
+        header = row(c4="№ сделки", c7="Дата\nзаключен.", c10="Дата\nрасчетов", c12="ISIN/рег.код", c14="Актив", c16="Количество актива⁷", c19="Сумма сделки", c21="В т.ч. НКД", c23="Валюта расчетов", c24="Комиссия\nбанка", c28="Коммент.")
         purchase = row(c4="1\nother", c7="01.09.2026 12:00:00", c10="02.09.2026 00:00:00", c12=ISIN, c16=2, c19=1900, c21=20, c23="RUB", c24=6)
         repo = row(c4="repo", c7="01.09.2026", c10="02.09.2026", c12=ISIN, c16=-2, c19=1900, c23="RUB", c28="репо ч.1")
         cash = [row(c2="Дата", c9="Наименование операции", c10="Комментарий"), row(c14="RUB")]
         cash += [row(c2=datetime(2026, 9, 29), c6=datetime(2026, 9, 29, 14), c10="погашение купона 4B02-04-00492-R-002P", c14=60)]
-        sheets = {"Динамика позиций": positions, "Завершенные сделки": [header, purchase, repo], " Движение ДС": cash}
+        closed = row(c4='closed', c7='01.09.2026', c10='02.09.2026', c12='RU000A106HB4', c14='ВУШ БО 001P-02', c16=4, c19=4000, c21=10, c23='RUB', c24=4)
+        stock = row(c4='stock', c12='RU0009029540', c14='Сбербанк')
+        sheets = {"Динамика позиций": positions, "Завершенные сделки": [header, purchase, repo, closed, stock], " Движение ДС": cash,
+                  'Неторговые операции': [()] * 15 + [row(c6='ВУШ БО 001P-02 RU000A106HB4', c10='Аннулирование выпуска WHOOSH001Р02.') ]}
         class Workbook:
             def __iter__(self):
                 return iter([SimpleNamespace(title=k, iter_rows=lambda values_only, rows=v: iter(rows)) for k, v in sheets.items()])
@@ -405,7 +437,10 @@ class ParserTest(unittest.TestCase):
             pass
         with patch.dict(sys.modules, {"openpyxl": SimpleNamespace(load_workbook=lambda *a, **k: Workbook())}):
             parsed = inv.parse_alfa(content.getvalue())
-        self.assertEqual(len(parsed["trades"]), 1)
+        self.assertEqual(len(parsed["trades"]), 2)
+        self.assertEqual(parsed['bonds']['RU000A106HB4']['quantity'], '0')
+        self.assertNotIn('RU0009029540', parsed['bonds'])
+        self.assertFalse(parsed['warnings'])
         self.assertEqual(parsed["trades"][0]["nkd"], "20")
         self.assertEqual(parsed["cash"][0]["regnumber"], "4B02-04-00492-R-002P")
         self.assertEqual(parsed["bonds"][ISIN]["quantity"], "2")

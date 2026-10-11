@@ -174,8 +174,6 @@ def parse_alfa(content):
         }
         if dec(bonds[isin]["opening"]) < 0 or dec(bonds[isin]["quantity"]) < 0:
             raise ValueError("Короткие позиции по облигациям пока не поддерживаются.")
-    if not bonds:
-        raise ValueError("В отчёте не найдено облигаций.")
     trades = []
     trade_rows = sheets["Завершенные сделки"]
     h = next((r for r in trade_rows if any(clean(v) == "№ сделки" for v in r)), None)
@@ -187,17 +185,20 @@ def parse_alfa(content):
         "id": "№ сделки", "date": "Дата заключен", "settled": "Дата расчетов",
         "isin": "ISIN", "qty": "Количество актива", "amount": "Сумма сделки",
         "nkd": "В т.ч. НКД", "fee": "Комиссия банка", "currency": "Валюта расчетов",
-        "comment": "Коммент.",
+        "comment": "Коммент.", "name": "Актив",
     }.items()}
     if any(columns[k] is None for k in ("id", "date", "settled", "isin", "qty", "amount", "nkd", "fee", "currency")):
         raise ValueError("Неизвестный формат колонок сделок.")
     for row in trade_rows:
         isin = clean(row[columns["isin"]])
-        if isin not in bonds:
-            continue
         comment = clean(row[columns["comment"]]) if columns["comment"] is not None else ""
         if "репо" in comment.lower():
             continue
+        if isin not in bonds:
+            name = clean(row[columns['name']]) if columns['name'] is not None else ''
+            if not ISIN_RE.fullmatch(isin) or not re.search(r'\bБО\b|облигац|\bОФЗ\b', name, re.IGNORECASE):
+                continue
+            bonds[isin] = {'name': name, 'opening': '0', 'quantity': '0', 'reported_value': '0', 'trade_only': True}
         if clean(row[columns["currency"]]) not in ("RUB", "SUR"):
             raise ValueError("Пока поддерживаются только рублёвые облигации.")
         trades.append({
@@ -209,6 +210,8 @@ def parse_alfa(content):
             "nkd": str(dec(row[columns["nkd"]] or 0)),
             "fee": str(dec(row[columns["fee"]] or 0)),
         })
+    if not bonds:
+        raise ValueError("В отчёте не найдено облигаций.")
     cash = []
     cash_rows = sheets["Движение ДС"]
     h = next((r for r in cash_rows if "Наименование операции" in [clean(v) for v in r]), None)
@@ -243,6 +246,9 @@ def parse_alfa(content):
     warnings = []
     # Do not silently invent acquisition costs for non-trading transfers/corporate actions.
     for row in sheets.get("Неторговые операции", [])[15:]:
+        # Redemption cancellation is reconciled against cash and MOEX in results.
+        if 'аннулирование выпуска' in ' '.join(clean(v) for v in row).casefold():
+            continue
         if any(isin in " ".join(clean(v) for v in row) or bond["name"] in " ".join(clean(v) for v in row)
                for isin, bond in bonds.items()):
             warnings.append("Есть неторговые операции с облигациями: себестоимость требует проверки.")
@@ -253,15 +259,13 @@ def parse_alfa(content):
 
 def import_report(connection, chat_id, content):
     digest = hashlib.sha256(content).hexdigest()
-    if connection.execute("SELECT 1 FROM investment_reports WHERE chat_id=? AND sha256=?", (chat_id, digest)).fetchone():
-        return None
     report = parse_alfa(content)
-    save_report(connection, chat_id, digest, report)
-    return report
+    return report if save_report(connection, chat_id, digest, report) else None
 
 
 def save_report(connection, chat_id, digest, report):
-    if connection.execute("SELECT 1 FROM investment_reports WHERE chat_id=? AND sha256=?", (chat_id, digest)).fetchone():
+    same = connection.execute("SELECT data FROM investment_reports WHERE chat_id=? AND sha256=?", (chat_id, digest)).fetchone()
+    if same and json.loads(same[0]) == report:
         return False
     existing = connection.execute("SELECT data FROM investment_reports WHERE chat_id=?", (chat_id,)).fetchall()
     if any(json.loads(r[0])["account"] != report["account"] for r in existing):
@@ -271,7 +275,11 @@ def save_report(connection, chat_id, digest, report):
     for trade in report["trades"]:
         if trade["id"] in old_trades and trade != old_trades[trade["id"]]:
             raise ValueError("Сделка отличается от ранее импортированной. Отчёт не сохранён.")
-    connection.execute("INSERT INTO investment_reports VALUES (?, ?, ?, ?, ?, ?)",
+    if same:
+        previous = json.loads(same[0])
+        if not {t['id'] for t in previous['trades']}.issubset({t['id'] for t in report['trades']}) or previous['cash'] != report['cash']:
+            raise ValueError('Обновлённый импорт теряет операции. Отчёт не сохранён.')
+    connection.execute("INSERT INTO investment_reports VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(chat_id,sha256) DO UPDATE SET data=excluded.data",
                        (chat_id, report["account"], digest, report["start"], report["end"], json.dumps(report, ensure_ascii=False)))
     return True
 
@@ -314,6 +322,9 @@ def portfolio(connection, chat_id):
         bond["quantity"] = latest["bonds"].get(isin, {}).get("quantity", "0")
         bond["reported_value"] = latest["bonds"].get(isin, {}).get("reported_value", "0")
         expected = dec(bond["opening"]) + sum((dec(t["quantity"]) for t in bond["trades"].values()), Decimal(0))
+        bond['expected_quantity'] = expected
+        bond['history_complete'] = dec(bond['opening']) == 0 and expected >= 0 and not result['warnings']
+        bond['asof'] = result['asof']
         bond["complete"] = dec(bond["opening"]) == 0 and expected == dec(bond["quantity"]) and not result["warnings"]
     result["warnings"] = list(dict.fromkeys(result["warnings"]))
     return result
@@ -427,6 +438,15 @@ def results(bond, market, payments):
             realized += amount - fee - cost
     coupons = sum((dec(c["amount"]) for c in payments if c["kind"] == "coupon"), Decimal(0))
     principal = sum((dec(c["amount"]) for c in payments if c["kind"] == "principal"), Decimal(0))
+    # Fully redeemed positions disappear from Alfa's ending positions. Verify the
+    # missing units against the exchange's final redemption, not a guessed sale.
+    if not complete and bond.get('history_complete') and dec(bond['quantity']) == 0:
+        maturity = market['security'].get('MATDATE') or market['description'].get('MATDATE')
+        if maturity and maturity != '0000-00-00' and day(maturity) <= bond['asof']:
+            final = [r for r in market['amortizations'] if r.get('amortdate') and day(r['amortdate']) == day(maturity)]
+            paid = sum((dec(p['amount']) for p in payments if p['kind'] == 'principal' and day(p['date']) >= day(maturity)), Decimal(0))
+            face = sum((payment_value(r) or Decimal(0) for r in final), Decimal(0))
+            complete = bool(face > 0 and paid == bond['expected_quantity'] * face)
     # Corporate-action cost allocation is not guessed. Full profit via cash+valuation
     # remains unavailable until the quantity/history reconciliation succeeds.
     allocation_complete = complete and not principal
@@ -439,10 +459,16 @@ def results(bond, market, payments):
         value = qty * (dec(market["price"]) / 100 * dec(sec["FACEVALUE"]) + dec(sec["ACCRUEDINT"]))
     cost = sum((q * unit for q, unit in lots), Decimal(0)) if allocation_complete else None
     total = net_trades + coupons + principal + value if complete and value is not None else None
+    clean_trades = sum(((Decimal(-1) if dec(t['quantity']) > 0 else Decimal(1)) * (dec(t['amount']) - dec(t['nkd'])) for t in bond['trades'].values()), Decimal(0))
+    accrued_trades = sum(((Decimal(-1) if dec(t['quantity']) > 0 else Decimal(1)) * dec(t['nkd']) for t in bond['trades'].values()), Decimal(0))
+    current_accrued = qty * dec(sec.get('ACCRUEDINT') or 0)
+    price_result = clean_trades + principal + value - current_accrued if total is not None else None
+    accrued_result = accrued_trades + current_accrued if total is not None else None
     return {"value": value, "cost": cost, "coupons": coupons, "principal": principal, "fees": fees,
             "realized": realized if allocation_complete else None,
             "unrealized": value - cost if allocation_complete and value is not None else None,
-            "total": total, "complete": complete, "net_trades": net_trades}
+            "total": total, "complete": complete, "net_trades": net_trades,
+            'price_result': price_result, 'accrued_result': accrued_result}
 
 
 def payment_value(row):
@@ -531,8 +557,12 @@ def pnl_text(state, markets, cash, unmatched):
         fees = sum((r["fees"] for r in calculated), Decimal(0))
         if not complete:
             lines.append("Из чего состоит эта сумма:")
-        lines.extend([f"Получено купонов: {rub(coupons)}", f"Заработано на продаже: {rub(realized)}",
-                      f"Изменение стоимости оставшихся: {rub(unrealized)}", f"Комиссии: {rub(fees)} — уже вычтены"])
+        price = sum((r['price_result'] for r in calculated), Decimal(0))
+        accrued = sum((r['accrued_result'] for r in calculated), Decimal(0))
+        lines.extend([f"Изменение цены бумаг: {rub(price)}", f"Получено купонов: {rub(coupons)}",
+                      f"Накопленные проценты (с учётом покупки и продажи): {rub(accrued)}",
+                      f"Потеряно на комиссиях: {rub(fees)}"])
+        lines.append('Итог = изменение цены + купоны + накопленные проценты − комиссии.')
     if missing:
         lines.append("Не хватает истории или цены: " + ", ".join(missing))
     if unmatched:
@@ -644,6 +674,7 @@ def report_text(connection, chat_id, command, argument, today, market, detailed=
             if command in ("/portfolio", "/bond"):
                 lines.append(f"Стоимость покупки оставшихся: {rub(r['cost'])}\nТекущая стоимость с НКД: {rub(r['value'])}")
             if command in ("/profit", "/bond"):
+                lines.append(f"Изменение цены: {rub(r['price_result'])}\nКупоны: {rub(r['coupons'])}\nНакопленные проценты: {rub(r['accrued_result'])}\nКомиссии: {rub(r['fees'])}")
                 lines.append(f"Купоны получены: {rub(r['coupons'])}\nРеализованный результат сделок: {rub(r['realized'])}\nИзменение стоимости с НКД: {rub(r['unrealized'])}\nОбщий результат: {rub(r['total'])}")
             lines.append(f"Котировка: {m['quote_at'] or 'недоступна'}" + (" (сохранённая, обновить не удалось)" if m["stale"] else ""))
             if m["security"].get("SETTLEDATE"):
