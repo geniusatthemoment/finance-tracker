@@ -311,16 +311,16 @@ class InvestmentsTest(unittest.TestCase):
         rows = inv.reconstruct_month(self.state(), {ISIN:market()}, {ISIN:[history_quote(),history_quote('2026-10-02',99,11)]}, date(2026,10,1), date(2026,10,4))
         self.assertEqual(len(rows), 3)
         self.assertTrue(all(r['complete'] for r in rows))
-        self.assertEqual(Decimal(rows[0]['value']), Decimal('1980'))
-        self.assertEqual(Decimal(rows[1]['value']), Decimal('3003'))
+        self.assertEqual(Decimal(rows[0]['value']), Decimal('1960'))
+        self.assertEqual(Decimal(rows[1]['value']), Decimal('2972.97'))
         self.assertEqual(rows[0]['positions'][ISIN]['quantity'], '2')
         self.assertEqual(rows[1]['positions'][ISIN]['quantity'], '3')
         self.assertTrue(rows[2]['carried_quotes'])
         self.assertEqual(rows[2]['positions'][ISIN]['quote_day'], '2026-10-02')
         text = inv.daily_change_text(rows[1], rows[0])
-        self.assertIn('Цена: +20 ₽ · НКД: +3 ₽', text)
+        self.assertIn('Цена: +20 ₽ · НКД: -7.03 ₽', text)
         self.assertIn('Купоны: +20 ₽ · комиссии: -3 ₽', text)
-        self.assertIn('Итого с закрытия 01.10: +40 ₽', text)
+        self.assertIn('Итого с закрытия 01.10: +29.97 ₽', text)
         self.assertEqual(len(text.splitlines()), 5)
 
     def test_history_missing_quotes_and_short_history_not_fabricated(self):
@@ -351,7 +351,7 @@ class InvestmentsTest(unittest.TestCase):
             self.assertEqual(c.execute('SELECT COUNT(*) FROM investment_daily_history WHERE chat_id=1').fetchone()[0],3)
             self.assertEqual(c.execute('SELECT COUNT(*) FROM investment_daily_history WHERE chat_id=2').fetchone()[0],0)
             self.assertEqual(c.execute('SELECT data FROM investment_daily_snapshots').fetchone()[0],'real observation')
-            current={'ledger':inv.ledger_fingerprint(self.state())}
+            current={'ledger':inv.ledger_fingerprint(self.state()), 'nkd_basis':'calendar_v1'}
             previous=inv.previous_snapshot(c,1,date(2026,10,4),current)
             self.assertEqual(previous['source'],'moex_history_close')
             self.assertEqual(previous['day'],'2026-10-03')
@@ -364,9 +364,9 @@ class InvestmentsTest(unittest.TestCase):
         self.assertTrue(all(r['complete'] for r in rows))
         self.assertEqual(rows[1]['value'],'0')
         text=inv.daily_change_text(rows[1],rows[0])
-        self.assertIn('Цена: +40 ₽ · НКД: -20 ₽',text)
+        self.assertIn('Цена: +40 ₽ · НКД: 0 ₽',text)
         self.assertIn('Купоны: +30 ₽',text)
-        self.assertIn('Итого с закрытия 01.10: +50 ₽',text)
+        self.assertIn('Итого с закрытия 01.10: +70 ₽',text)
 
     def test_history_api_paginates_and_validates_isin(self):
         def payload(rows,index,total):
@@ -386,8 +386,8 @@ class InvestmentsTest(unittest.TestCase):
         m['price'] = 97; m['security']['ACCRUEDINT'] = 12
         second = inv.daily_snapshot(state, {ISIN: m}, '2026-10-02T10:00:00+07:00')
         text = inv.daily_change_text(second, first)
-        self.assertIn('Итого за день: -16 ₽', text)
-        self.assertIn('Цена: -20 ₽ · НКД: +4 ₽', text)
+        self.assertIn('Итого за день: -18.02 ₽', text)
+        self.assertIn('Цена: -20 ₽ · НКД: +1.98 ₽', text)
         self.assertEqual(len(text.splitlines()), 5)
         self.assertEqual(second['ledger'], first['ledger'])
 
@@ -400,6 +400,74 @@ class InvestmentsTest(unittest.TestCase):
         self.assertIn('обновлён отчёт', text)
         self.assertNotIn('Изменение оценки с', text)
         self.assertEqual(len(text.splitlines()), 5)
+
+    def test_daily_nkd_ignores_settlement_jump_for_127k_portfolio(self):
+        self.save(report(qty='127', trades=[trade(qty='127', amount='127000')]))
+        m = market()
+        m['coupons'] = [{'startdate':'2026-10-01', 'coupondate':'2026-10-31',
+                         'value':'16.44', 'faceunit':'RUB'}]
+        m['security'].update(ACCRUEDINT='8.22', SETTLEDATE='2026-10-16')
+        first = inv.daily_snapshot(self.state(), {ISIN:m}, '2026-10-15T10:00:00+07:00')
+        m['security'].update(ACCRUEDINT='10.41', SETTLEDATE='2026-10-20')
+        second = inv.daily_snapshot(self.state(), {ISIN:m}, '2026-10-16T10:00:00+07:00')
+        self.assertEqual(Decimal(second['nkd']) - Decimal(first['nkd']), Decimal('69.85'))
+        self.assertIn('НКД: +69.85 ₽', inv.daily_change_text(second, first))
+        # Daily-only normalization must not modify MOEX data used by /pnl.
+        self.assertEqual(m['security']['ACCRUEDINT'], '10.41')
+
+    def test_daily_nkd_accrues_on_weekends_with_unchanged_exchange_quote(self):
+        self.save()
+        m = market()
+        m['coupons'][1]['value'] = 91
+        snapshots = [inv.daily_snapshot(self.state(), {ISIN:m}, f'2026-10-{d}T10:00:00+07:00')
+                     for d in (16,17,18)]
+        for previous, current in zip(snapshots, snapshots[1:]):
+            self.assertEqual(Decimal(current['nkd']) - Decimal(previous['nkd']), Decimal('2'))
+
+    def test_archived_weekend_nkd_uses_calendar_not_carried_trade_date(self):
+        self.save(report(end='2026-10-18'))
+        m = market()
+        m['coupons'][1]['value'] = 91
+        rows = inv.reconstruct_month(self.state(), {ISIN:m},
+                                     {ISIN:[history_quote('2026-10-16', nkd=300)]},
+                                     date(2026,10,16), date(2026,10,19))
+        self.assertTrue(all(r['complete'] for r in rows))
+        self.assertEqual([Decimal(r['nkd']) for r in rows], [Decimal(30), Decimal(32), Decimal(34)])
+        self.assertTrue(rows[-1]['carried_quotes'])
+
+    def test_daily_coupon_reset_is_not_multiple_days_of_income(self):
+        self.save()
+        m = market()
+        previous = inv.daily_snapshot(self.state(), {ISIN:m}, '2026-09-30T10:00:00+07:00')
+        current = inv.daily_snapshot(self.state(), {ISIN:m}, '2026-10-01T10:00:00+07:00')
+        self.assertEqual(Decimal(previous['nkd']), Decimal('58'))
+        self.assertEqual(Decimal(current['nkd']), Decimal('0'))
+        text = inv.daily_change_text(current, previous)
+        self.assertIn('НКД: -58 ₽', text)
+        self.assertIn('выплата по графику не подтверждена', text)
+
+    def test_daily_unknown_coupon_and_stale_schedule_do_not_guess(self):
+        self.save()
+        for unknown in (True, False):
+            m = market()
+            if unknown:
+                m['coupons'][1]['value'] = None
+            else:
+                m['schedule_stale'] = True
+            with self.assertRaisesRegex(ValueError, 'Нет купонного графика'):
+                inv.daily_snapshot(self.state(), {ISIN:m}, '2026-10-02T10:00:00+07:00')
+
+    def test_daily_old_basis_and_missing_yesterday_reset_comparison(self):
+        self.save()
+        previous = inv.daily_snapshot(self.state(), {ISIN:market()}, '2026-10-01T10:00:00+07:00')
+        current = inv.daily_snapshot(self.state(), {ISIN:market()}, '2026-10-02T10:00:00+07:00')
+        legacy = dict(previous)
+        legacy.pop('nkd_basis')
+        self.assertIn('обновлён расчёт НКД', inv.daily_change_text(current, legacy))
+        current['observed_at'] = '2026-10-04T10:00:00+07:00'
+        text = inv.daily_change_text(current, previous)
+        self.assertIn('нет оценки за вчера', text)
+        self.assertNotIn('Итого за день:', text)
 
     def test_daily_first_and_unconfirmed_payments_are_explicit(self):
         self.save()
@@ -477,7 +545,7 @@ class InvestmentsTest(unittest.TestCase):
             text, keyboard = inv.report_text(c, 1, '/portfolio_day', '', date(2026,10,1), SimpleNamespace(all=lambda _: {ISIN:m}), observed_at='2026-10-01T14:00:00+07:00')
             saved = json.loads(c.execute('SELECT data FROM investment_daily_snapshots WHERE chat_id=1').fetchone()[0])
             self.assertEqual(saved, json.loads(json.dumps(first)))
-            self.assertIn('01.10 10:00: +20 ₽', text)
+            self.assertIn('нет оценки за вчера', text)
             self.assertIsNotNone(keyboard)
         self.assertFalse(bot.was_sent(1,date(2026,10,1),'investment_daily'))
         self.assertEqual(inv.command_text('сводка портфеля'), '/portfolio_day')
