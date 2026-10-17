@@ -379,7 +379,7 @@ class InvestmentsTest(unittest.TestCase):
         with self.db() as c:
             text, keyboard = inv.report_text(c, 1, '/portfolio_day', '', date(2026,10,1), SimpleNamespace(all=lambda _: {ISIN:m}), observed_at='2026-10-01T14:00:00+07:00')
             saved = json.loads(c.execute('SELECT data FROM investment_daily_snapshots WHERE chat_id=1').fetchone()[0])
-            self.assertEqual(saved, first)
+            self.assertEqual(saved, json.loads(json.dumps(first)))
             self.assertIn('01.10 10:00: +20.00 ₽', text)
             self.assertIsNotNone(keyboard)
         self.assertFalse(bot.was_sent(1,date(2026,10,1),'investment_daily'))
