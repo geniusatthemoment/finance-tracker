@@ -370,6 +370,39 @@ class InvestmentsTest(unittest.TestCase):
             finally:
                 bot.INVESTMENT_DAILY_PENDING.discard(1)
 
+    def test_manual_daily_report_keeps_baseline_and_schedule_unchanged(self):
+        self.save()
+        first = inv.daily_snapshot(self.state(), {ISIN: market()}, '2026-10-01T10:00:00+07:00')
+        with self.db() as c:
+            c.execute('INSERT INTO investment_daily_snapshots VALUES (?,?,?)', (1,'2026-10-01',json.dumps(first)))
+        m = market(); m['price'] = 99
+        with self.db() as c:
+            text, keyboard = inv.report_text(c, 1, '/portfolio_day', '', date(2026,10,1), SimpleNamespace(all=lambda _: {ISIN:m}), observed_at='2026-10-01T14:00:00+07:00')
+            saved = json.loads(c.execute('SELECT data FROM investment_daily_snapshots WHERE chat_id=1').fetchone()[0])
+            self.assertEqual(saved, first)
+            self.assertIn('01.10 10:00: +20.00 ₽', text)
+            self.assertIsNotNone(keyboard)
+        self.assertFalse(bot.was_sent(1,date(2026,10,1),'investment_daily'))
+        self.assertEqual(inv.command_text('сводка портфеля'), '/portfolio_day')
+        self.assertEqual(inv.command_text('изменение портфеля'), '/portfolio_day')
+
+    def test_preview_dispatch_is_allowlisted_and_persistently_deduplicated(self):
+        self.save(); bot.ensure_user(1)
+        with patch.dict(bot.os.environ, {'PORTFOLIO_PREVIEW_CHAT_ID':'1','PORTFOLIO_PREVIEW_REQUEST':'test'}), patch.object(bot, 'ALLOWED_USER_IDS', {1}), patch.object(bot.INVESTMENT_WORKERS, 'submit') as submit:
+            try:
+                bot.dispatch_portfolio_preview()
+                self.assertEqual(submit.call_count, 1)
+                self.assertEqual(submit.call_args.args[-1], 'portfolio_preview:test')
+                bot.INVESTMENT_PENDING.discard(1)
+                bot.mark_sent(1,date(2026,9,30),'portfolio_preview:test')
+                bot.dispatch_portfolio_preview()
+                self.assertEqual(submit.call_count, 1)
+                with patch.object(bot, 'ALLOWED_USER_IDS', {2}):
+                    bot.dispatch_portfolio_preview()
+                self.assertEqual(submit.call_count, 1)
+            finally:
+                bot.INVESTMENT_PENDING.discard(1)
+
     def test_pnl_route_registered(self):
         message = {"chat": {"id": 1}, "from": {"id": 1}, "text": "/pnl"}
         with patch.object(bot, "ALLOWED_USER_IDS", {1}), patch.object(bot, "handle_investment_command") as handle:

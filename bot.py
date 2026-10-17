@@ -1731,8 +1731,11 @@ def send_investment_text(chat_id, text, reply_markup=None):
         current += ("\n" if current else "") + line
     if current:
         chunks.append(current)
+    delivered = True
     for i, chunk in enumerate(chunks):
-        send(chat_id, chunk, reply_markup if i == len(chunks) - 1 else None)
+        if send(chat_id, chunk, reply_markup if i == len(chunks) - 1 else None) is None:
+            delivered = False
+    return delivered
 
 
 def handle_investment_document(chat_id, document):
@@ -1772,15 +1775,22 @@ INVESTMENT_PENDING = set()
 INVESTMENT_LOCK = threading.Lock()
 
 
-def investment_worker(chat_id, command, argument, today, detailed):
+def investment_worker(chat_id, command, argument, today, detailed, preview_key=None):
     started = time.monotonic()
     print("Investment calculation started:", command, flush=True)
     try:
+        observed_at = None
+        if command == '/portfolio_day':
+            user = get_user(chat_id)
+            observed_at = datetime.now(ZoneInfo(user['timezone'] if user else DEFAULT_TIMEZONE)).isoformat(timespec='seconds')
         with db() as connection:
             result, keyboard = investments.report_text(
-                connection, chat_id, command, argument, today, investments.Market(db), detailed=detailed
+                connection, chat_id, command, argument, today, investments.Market(db), detailed=detailed, observed_at=observed_at
             )
-        send_investment_text(chat_id, result, keyboard)
+        delivered = send_investment_text(chat_id, result, keyboard)
+        if preview_key and delivered:
+            mark_sent(chat_id, today, preview_key)
+            print('Portfolio preview delivered', flush=True)
     except ValueError as error:
         send(chat_id, str(error))
     except Exception as error:
@@ -2021,6 +2031,7 @@ def help_text():
         "/undo — удалить последнюю запись\n"
         "/zero — сегодня без трат\n"
         "/pnl — общий результат по облигациям сейчас\n"
+        "/portfolio_day — изменение портфеля, рыночная цена и НКД\n"
         "/invest — облигации, прибыль, прогноз и импорт брокерского XLSX\n"
         "/help — эта подсказка"
     )
@@ -3006,6 +3017,36 @@ def run_schedule():
                     reminder(user["chat_id"], day, reminder_types[index], message, midnight=after_midnight)
 
 
+def dispatch_portfolio_preview():
+    """Optional operator-requested one-off delivery, deduplicated across restarts."""
+    target = os.environ.get('PORTFOLIO_PREVIEW_CHAT_ID', '')
+    request = os.environ.get('PORTFOLIO_PREVIEW_REQUEST', '')
+    if not target.isdigit() or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', request):
+        return
+    chat_id = int(target)
+    if chat_id not in ALLOWED_USER_IDS:
+        return
+    key = 'portfolio_preview:' + request
+    with db() as connection:
+        if connection.execute('SELECT 1 FROM sent_messages WHERE chat_id=? AND message_type=? LIMIT 1', (chat_id, key)).fetchone():
+            return
+        if not connection.execute('SELECT 1 FROM investment_reports WHERE chat_id=? LIMIT 1', (chat_id,)).fetchone():
+            return
+    user = get_user(chat_id)
+    if not user:
+        return
+    with INVESTMENT_LOCK:
+        if chat_id in INVESTMENT_PENDING:
+            return
+        INVESTMENT_PENDING.add(chat_id)
+    try:
+        INVESTMENT_WORKERS.submit(investment_worker, chat_id, '/portfolio_day', '', user_calendar_today(user), False, key)
+    except Exception:
+        with INVESTMENT_LOCK:
+            INVESTMENT_PENDING.discard(chat_id)
+        raise
+
+
 def main():
     if not TOKEN:
         print("Set TELEGRAM_BOT_TOKEN first.", file=sys.stderr)
@@ -3015,6 +3056,7 @@ def main():
         raise SystemExit(1)
     ZoneInfo(DEFAULT_TIMEZONE)  # fail early on a typo
     init_db()
+    dispatch_portfolio_preview()
     print("Bot is running. Press Ctrl+C to stop.")
     offset = 0
     while True:

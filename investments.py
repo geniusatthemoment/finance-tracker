@@ -24,11 +24,12 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 ISS = "https://iss.moex.com/iss"
 MAX_FILE = 10_000_000
 ISIN_RE = re.compile(r"^[A-Z]{2}[A-Z0-9]{9}\d$")
-COMMANDS = {"/portfolio", "/profit", "/pnl", "/forecast", "/maturity", "/bond", "/payments", "/invest", "/invest_import"}
+COMMANDS = {"/portfolio", "/portfolio_day", "/profit", "/pnl", "/forecast", "/maturity", "/bond", "/payments", "/invest", "/invest_import"}
 HELP = (
     "Твои облигации\n\n"
     "/pnl — сколько заработал или потерял\n"
     "/portfolio — что у тебя куплено\n"
+    "/portfolio_day — утренняя сводка портфеля сейчас\n"
     "/forecast 31.12.2026 — сколько получишь к дате\n"
     "/maturity — сколько заработаешь до погашения\n"
     "/payments — когда ближайшие выплаты\n"
@@ -39,6 +40,7 @@ HELP = (
 MENU = {"inline_keyboard": [
     [{"text": "Сколько заработал", "callback_data": "investcmd:pnl"}],
     [{"text": "Мои облигации", "callback_data": "investcmd:portfolio"}],
+    [{"text": "Изменение за день", "callback_data": "investcmd:portfolio_day"}],
     [{"text": "До погашения", "callback_data": "investcmd:maturity"},
      {"text": "Ближайшие выплаты", "callback_data": "investcmd:payments"}],
     [{"text": "До какой даты?", "callback_data": "investcmd:forecast"}],
@@ -49,7 +51,8 @@ def command_text(text):
     """Plain Russian shortcuts, without intercepting valid expense entries."""
     normalized = text.strip().casefold()
     aliases = {"облигации": "/invest", "мои облигации": "/portfolio", "сколько заработал": "/pnl",
-               "прибыль по облигациям": "/pnl", "до погашения": "/maturity", "ближайшие выплаты": "/payments"}
+               "прибыль по облигациям": "/pnl", "до погашения": "/maturity", "ближайшие выплаты": "/payments",
+               "сводка портфеля": "/portfolio_day", "изменение портфеля": "/portfolio_day"}
     if normalized in aliases:
         return aliases[normalized]
     match = re.fullmatch(r"(?:до|прогноз)\s+(\d{1,2}\.\d{1,2}\.\d{4})", normalized)
@@ -700,7 +703,7 @@ def simple_report(state, markets, cash, unmatched, command, target, today):
     return "\n".join(lines), keyboard
 
 
-def report_text(connection, chat_id, command, argument, today, market, detailed=False):
+def report_text(connection, chat_id, command, argument, today, market, detailed=False, observed_at=None):
     state = portfolio(connection, chat_id)
     if not state:
         return HELP, None
@@ -719,6 +722,17 @@ def report_text(connection, chat_id, command, argument, today, market, detailed=
             return "Выбери выпуск:", {"inline_keyboard": [[{"text": bonds[i]["name"], "callback_data": "investbond:" + i}] for i in matches]}
         bonds = {matches[0]: bonds[matches[0]]}
     markets = market.all(list(state["bonds"]))
+    if command == '/portfolio_day':
+        previous = connection.execute(
+            '''SELECT data FROM investment_daily_snapshots WHERE chat_id=? AND day<=?
+               ORDER BY CASE WHEN day<? THEN 0 ELSE 1 END, day DESC LIMIT 1''',
+            (chat_id, today.isoformat(), today.isoformat()),
+        ).fetchone()
+        current = daily_snapshot(state, markets, observed_at or today.isoformat() + 'T10:00:00')
+        if previous is None:
+            connection.execute('INSERT OR IGNORE INTO investment_daily_snapshots VALUES (?,?,?)',
+                               (chat_id, today.isoformat(), json.dumps(current, ensure_ascii=False)))
+        return daily_change_text(current, json.loads(previous[0]) if previous else None), MENU
     cash, unmatched = cash_by_bond(state, markets)
     if command == "/pnl" or (command == "/profit" and not detailed):
         return pnl_text(state, markets, cash, unmatched), {"inline_keyboard": [[{"text": "Подробнее по каждой облигации", "callback_data": "investdetail:profit:"}]]}
