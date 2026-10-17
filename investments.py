@@ -578,29 +578,35 @@ def daily_snapshot(state, markets, observed_at):
 
 
 def daily_change_text(current, previous):
+    def money(value):
+        return rub(value).replace('.00 ₽', ' ₽')
+
     def signed(value):
-        return ('+' if dec(value) > 0 else '') + rub(value)
-    lines = ['Портфель · утренняя сводка', f"Стоимость бумаг с НКД: {rub(current['value'])}"]
-    comparable = previous and previous['ledger'] == current['ledger']
+        return ('+' if dec(value) > 0 else '') + money(value)
+
+    at = datetime.fromisoformat(current['observed_at'])
+    months = ('января', 'февраля', 'марта', 'апреля', 'мая', 'июня', 'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря')
+    comparable = previous is not None and previous['ledger'] == current['ledger']
+    lines = [f'{at.day} {months[at.month - 1]} · портфель',
+             f"Было {money(previous['value']) if comparable else '—'} → стало {money(current['value'])}"]
     if comparable:
-        start = datetime.fromisoformat(previous['observed_at'])
-        lines.extend([f"Изменение оценки с {start:%d.%m %H:%M}: {signed(dec(current['value']) - dec(previous['value']))}",
-                      f"• Рыночная стоимость без НКД: {signed(dec(current['price']) - dec(previous['price']))}",
-                      f"• Изменение НКД: {signed(dec(current['nkd']) - dec(previous['nkd']))}"])
+        lines.append(f"Цена: {signed(dec(current['price']) - dec(previous['price']))} · НКД: {signed(dec(current['nkd']) - dec(previous['nkd']))}")
     else:
-        lines.append('История операций обновлена — сравнение начнётся со следующей сводки.' if previous else 'Сохранил первую оценку. Изменение покажу в следующей сводке.')
-        lines.extend([f"Рыночная стоимость без НКД: {rub(current['price'])}", f"НКД сейчас: {rub(current['nkd'])}"])
-        for key, label in [('coupons', 'Получено купонов'), ('fees', 'Комиссии сделок'), ('principal', 'Возврат номинала (не прибыль)')]:
-            if dec(current[key]):
-                lines.append(f"{label} за всю загруженную историю: {rub(current[key])}")
-    if current['total'] is not None:
-        lines.append(f"Общий результат с покупки после комиссий: {signed(current['total'])}")
-    relevant_pending = [e for e in current['pending'] if not previous or e[0] > previous['observed_at'][:10]]
-    if relevant_pending:
-        lines.append('По графику были выплаты: ' + ', '.join(sorted({e[1] for e in relevant_pending})) + '. Они не подтверждены отчётом; снижение оценки бумаг не обязательно означает убыток. Обнови XLSX.')
-    if current['quote_at']:
-        lines.append('Котировки: ' + ' — '.join([current['quote_at'][0], current['quote_at'][-1]]) if len(current['quote_at']) > 1 else 'Котировки: ' + current['quote_at'][0])
-    lines.append(f"Операции и выплаты подтверждены по {day(current['asof']):%d.%m.%Y}. Новые купоны и комиссии автоматически не загружаются. Без налогов.")
+        lines.append('Цена: — · НКД: — (нет сравнения)')
+    if comparable and day(current['asof']) >= at.date():
+        lines.append('Купоны: 0 ₽ · комиссии: 0 ₽')
+    else:
+        lines.append(f"Купоны/комиссии: нет новых данных после {day(current['asof']):%d.%m}")
+    pending = [e for e in current['pending'] if not previous or e[0] > previous['observed_at'][:10]]
+    if not comparable:
+        lines.append('Итого: — · обновлён отчёт, новая точка отсчёта' if previous else 'Итого: — · первая оценка, сравнение со следующей сводки')
+    elif pending:
+        lines.append('Итого: — · выплата по графику не подтверждена; обнови XLSX')
+    else:
+        start = datetime.fromisoformat(previous['observed_at'])
+        period = 'за день' if (at.date() - start.date()).days == 1 else f'с {start:%d.%m %H:%M}'
+        qualifier = '' if day(current['asof']) >= at.date() else ' (только цена и НКД)'
+        lines.append(f"Итого {period}: {signed(dec(current['value']) - dec(previous['value']))}{qualifier}")
     return '\n'.join(lines)
 
 

@@ -307,9 +307,9 @@ class InvestmentsTest(unittest.TestCase):
         m['price'] = 97; m['security']['ACCRUEDINT'] = 12
         second = inv.daily_snapshot(state, {ISIN: m}, '2026-10-02T10:00:00+07:00')
         text = inv.daily_change_text(second, first)
-        self.assertIn('01.10 10:00: -16.00 ₽', text)
-        self.assertIn('без НКД: -20.00 ₽', text)
-        self.assertIn('Изменение НКД: +4.00 ₽', text)
+        self.assertIn('Итого за день: -16 ₽', text)
+        self.assertIn('Цена: -20 ₽ · НКД: +4 ₽', text)
+        self.assertEqual(len(text.splitlines()), 5)
         self.assertEqual(second['ledger'], first['ledger'])
 
     def test_daily_history_change_resets_comparison(self):
@@ -318,17 +318,34 @@ class InvestmentsTest(unittest.TestCase):
         self.save(report(end='2026-10-01', cash=[payment()]), digest='new')
         second = inv.daily_snapshot(self.state(), {ISIN: market()}, '2026-10-02T10:00:00+07:00')
         text = inv.daily_change_text(second, first)
-        self.assertIn('История операций обновлена', text)
+        self.assertIn('обновлён отчёт', text)
         self.assertNotIn('Изменение оценки с', text)
-        self.assertIn('за всю загруженную историю', text)
+        self.assertEqual(len(text.splitlines()), 5)
 
     def test_daily_first_and_unconfirmed_payments_are_explicit(self):
         self.save()
         first = inv.daily_snapshot(self.state(), {ISIN: market()}, '2026-10-01T10:00:00+07:00')
         text = inv.daily_change_text(first, None)
-        self.assertIn('первую оценку', text)
-        self.assertIn('не подтверждены отчётом', text)
+        self.assertIn('первая оценка', text)
+        self.assertIn('нет новых данных', text)
+        self.assertEqual(len(text.splitlines()), 5)
         self.assertNotIn('Изменение оценки с', text)
+
+    def test_compact_daily_fresh_history_and_pending_payments(self):
+        self.save()
+        first = inv.daily_snapshot(self.state(), {ISIN:market()}, '2026-10-01T10:00:00+07:00')
+        current = dict(first, observed_at='2026-10-02T10:00:00+07:00', asof='2026-10-02', pending=[])
+        text = inv.daily_change_text(current, first)
+        self.assertEqual(len(text.splitlines()), 5)
+        self.assertIn('2 октября · портфель', text)
+        self.assertIn('Купоны: 0 ₽ · комиссии: 0 ₽', text)
+        self.assertIn('Итого за день: 0 ₽', text)
+        current['pending'] = [('2026-10-02','Тест')]
+        current['asof'] = '2026-09-30'
+        text = inv.daily_change_text(current, first)
+        self.assertEqual(len(text.splitlines()), 5)
+        self.assertIn('выплата по графику не подтверждена', text)
+        self.assertNotIn('Купоны: 0', text)
 
     def test_daily_missing_or_stale_quotes_not_zero(self):
         self.save(); m = market()
@@ -346,7 +363,8 @@ class InvestmentsTest(unittest.TestCase):
             send.assert_not_called()
             bot.investment_daily_worker(1, date(2026,10,2), '2026-10-02T10:00:00+07:00')
             self.assertTrue(bot.was_sent(1, date(2026,10,2), 'investment_daily'))
-            self.assertIn('01.10 15:00', send.call_args.args[1])
+            self.assertIn('Итого за день:', send.call_args.args[1])
+            self.assertEqual(len(send.call_args.args[1].splitlines()), 5)
         with self.db() as c:
             self.assertEqual(c.execute('SELECT COUNT(*) FROM investment_daily_snapshots WHERE chat_id=1').fetchone()[0], 2)
             self.assertEqual(c.execute('SELECT COUNT(*) FROM investment_daily_snapshots WHERE chat_id=2').fetchone()[0], 0)
@@ -380,7 +398,7 @@ class InvestmentsTest(unittest.TestCase):
             text, keyboard = inv.report_text(c, 1, '/portfolio_day', '', date(2026,10,1), SimpleNamespace(all=lambda _: {ISIN:m}), observed_at='2026-10-01T14:00:00+07:00')
             saved = json.loads(c.execute('SELECT data FROM investment_daily_snapshots WHERE chat_id=1').fetchone()[0])
             self.assertEqual(saved, json.loads(json.dumps(first)))
-            self.assertIn('01.10 10:00: +20.00 ₽', text)
+            self.assertIn('01.10 10:00: +20 ₽', text)
             self.assertIsNotNone(keyboard)
         self.assertFalse(bot.was_sent(1,date(2026,10,1),'investment_daily'))
         self.assertEqual(inv.command_text('сводка портфеля'), '/portfolio_day')
