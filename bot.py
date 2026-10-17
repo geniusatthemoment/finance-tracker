@@ -2914,6 +2914,62 @@ def send_daily_profit(user, day):
         mark_sent(user["chat_id"], day, "daily_profit")
 
 
+INVESTMENT_DAILY_PENDING = set()
+
+
+def investment_daily_worker(chat_id, today, observed_at, notify=True):
+    try:
+        with db() as connection:
+            state = investments.portfolio(connection, chat_id)
+            previous = connection.execute(
+                'SELECT data FROM investment_daily_snapshots WHERE chat_id=? AND day<? ORDER BY day DESC LIMIT 1',
+                (chat_id, today.isoformat()),
+            ).fetchone()
+        if not state:
+            return
+        snapshot = investments.daily_snapshot(state, investments.Market(db).all(list(state['bonds'])), observed_at)
+        with db() as connection:
+            connection.execute('INSERT INTO investment_daily_snapshots VALUES (?,?,?) ON CONFLICT(chat_id,day) DO UPDATE SET data=excluded.data',
+                               (chat_id, today.isoformat(), json.dumps(snapshot, ensure_ascii=False)))
+        print('Investment daily snapshot saved:', today.isoformat(), flush=True)
+        if notify and send(chat_id, investments.daily_change_text(snapshot, json.loads(previous[0]) if previous else None), investments.MENU) is not None:
+            mark_sent(chat_id, today, 'investment_daily')
+    except ValueError as error:
+        if notify and send(chat_id, 'Портфель · утренняя сводка\n' + str(error)) is not None:
+            mark_sent(chat_id, today, 'investment_daily')
+    except Exception as error:
+        print('Investment daily failed:', type(error).__name__, flush=True)
+        if notify and send(chat_id, 'Не удалось обновить утреннюю сводку портфеля. Последние цифры можно посмотреть через /pnl.') is not None:
+            mark_sent(chat_id, today, 'investment_daily')
+    finally:
+        with INVESTMENT_LOCK:
+            INVESTMENT_DAILY_PENDING.discard(chat_id)
+
+
+def schedule_investment_daily(user, local_now):
+    chat_id = user['chat_id']
+    if chat_id not in ALLOWED_USER_IDS:
+        return
+    today = local_now.date()
+    with db() as connection:
+        if not connection.execute('SELECT 1 FROM investment_reports WHERE chat_id=? LIMIT 1', (chat_id,)).fetchone():
+            return
+        baseline = connection.execute('SELECT 1 FROM investment_daily_snapshots WHERE chat_id=? LIMIT 1', (chat_id,)).fetchone()
+    notify = local_now.hour == 10 and local_now.minute < 5
+    if (not notify and baseline) or (notify and was_sent(chat_id, today, 'investment_daily')):
+        return
+    with INVESTMENT_LOCK:
+        if chat_id in INVESTMENT_DAILY_PENDING:
+            return
+        INVESTMENT_DAILY_PENDING.add(chat_id)
+    try:
+        INVESTMENT_WORKERS.submit(investment_daily_worker, chat_id, today, local_now.isoformat(timespec='seconds'), notify)
+    except Exception:
+        with INVESTMENT_LOCK:
+            INVESTMENT_DAILY_PENDING.discard(chat_id)
+        raise
+
+
 def run_schedule():
     with db() as connection:
         users = connection.execute("SELECT * FROM users").fetchall()
@@ -2922,6 +2978,7 @@ def run_schedule():
         today = local_now.date()
         expense_today = business_day(local_now, user["day_cutoff_hour"])
         hour, minute = local_now.hour, local_now.minute
+        schedule_investment_daily(user, local_now)
         process_recurring(user, expense_today)
         if hour == max(user["morning_hour"], user["day_cutoff_hour"]) and minute < 5:
             send_morning_update(user, today)

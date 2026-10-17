@@ -300,6 +300,76 @@ class InvestmentsTest(unittest.TestCase):
         self.assertIn("По 0 из 1 облигаций: нет данных", text)
         self.assertIn("часть данных сохранённая", text)
 
+    def test_daily_price_and_nkd_changes_reconcile(self):
+        self.save(report(cash=[payment()]))
+        state = self.state(); m = market()
+        first = inv.daily_snapshot(state, {ISIN: m}, '2026-10-01T10:00:00+07:00')
+        m['price'] = 97; m['security']['ACCRUEDINT'] = 12
+        second = inv.daily_snapshot(state, {ISIN: m}, '2026-10-02T10:00:00+07:00')
+        text = inv.daily_change_text(second, first)
+        self.assertIn('01.10 10:00: -16.00 ₽', text)
+        self.assertIn('без НКД: -20.00 ₽', text)
+        self.assertIn('Изменение НКД: +4.00 ₽', text)
+        self.assertEqual(second['ledger'], first['ledger'])
+
+    def test_daily_history_change_resets_comparison(self):
+        self.save()
+        first = inv.daily_snapshot(self.state(), {ISIN: market()}, '2026-10-01T10:00:00+07:00')
+        self.save(report(end='2026-10-01', cash=[payment()]), digest='new')
+        second = inv.daily_snapshot(self.state(), {ISIN: market()}, '2026-10-02T10:00:00+07:00')
+        text = inv.daily_change_text(second, first)
+        self.assertIn('История операций обновлена', text)
+        self.assertNotIn('Изменение оценки с', text)
+        self.assertIn('за всю загруженную историю', text)
+
+    def test_daily_first_and_unconfirmed_payments_are_explicit(self):
+        self.save()
+        first = inv.daily_snapshot(self.state(), {ISIN: market()}, '2026-10-01T10:00:00+07:00')
+        text = inv.daily_change_text(first, None)
+        self.assertIn('первую оценку', text)
+        self.assertIn('не подтверждены отчётом', text)
+        self.assertNotIn('Изменение оценки с', text)
+
+    def test_daily_missing_or_stale_quotes_not_zero(self):
+        self.save(); m = market()
+        m['stale'] = True
+        with self.assertRaises(ValueError):
+            inv.daily_snapshot(self.state(), {ISIN: m}, '2026-10-01T10:00:00+07:00')
+        m['stale'] = False; m['price'] = None
+        with self.assertRaises(ValueError):
+            inv.daily_snapshot(self.state(), {ISIN: m}, '2026-10-01T10:00:00+07:00')
+
+    def test_daily_worker_persists_baseline_and_sends_only_when_requested(self):
+        self.save()
+        with patch.object(inv.Market, 'all', return_value={ISIN: market()}), patch.object(bot, 'send', return_value={'message_id': 1}) as send:
+            bot.investment_daily_worker(1, date(2026,10,1), '2026-10-01T15:00:00+07:00', False)
+            send.assert_not_called()
+            bot.investment_daily_worker(1, date(2026,10,2), '2026-10-02T10:00:00+07:00')
+            self.assertTrue(bot.was_sent(1, date(2026,10,2), 'investment_daily'))
+            self.assertIn('01.10 15:00', send.call_args.args[1])
+        with self.db() as c:
+            self.assertEqual(c.execute('SELECT COUNT(*) FROM investment_daily_snapshots WHERE chat_id=1').fetchone()[0], 2)
+            self.assertEqual(c.execute('SELECT COUNT(*) FROM investment_daily_snapshots WHERE chat_id=2').fetchone()[0], 0)
+
+    def test_daily_scheduler_uses_local_ten_and_deduplicates(self):
+        self.save(); user={'chat_id':1}
+        with self.db() as c:
+            c.execute('INSERT INTO investment_daily_snapshots VALUES (?,?,?)', (1,'2026-09-30','{}'))
+        with patch.object(bot, 'ALLOWED_USER_IDS', {1}), patch.object(bot.INVESTMENT_WORKERS, 'submit') as submit:
+            try:
+                bot.schedule_investment_daily(user, datetime.fromisoformat('2026-10-01T09:59:00+07:00'))
+                submit.assert_not_called()
+                bot.schedule_investment_daily(user, datetime.fromisoformat('2026-10-01T10:00:00+07:00'))
+                bot.schedule_investment_daily(user, datetime.fromisoformat('2026-10-01T10:01:00+07:00'))
+                self.assertEqual(submit.call_count, 1)
+                self.assertTrue(submit.call_args.args[-1])
+                bot.INVESTMENT_DAILY_PENDING.discard(1)
+                bot.mark_sent(1,date(2026,10,1),'investment_daily')
+                bot.schedule_investment_daily(user, datetime.fromisoformat('2026-10-01T10:02:00+07:00'))
+                self.assertEqual(submit.call_count, 1)
+            finally:
+                bot.INVESTMENT_DAILY_PENDING.discard(1)
+
     def test_pnl_route_registered(self):
         message = {"chat": {"id": 1}, "from": {"id": 1}, "text": "/pnl"}
         with patch.object(bot, "ALLOWED_USER_IDS", {1}), patch.object(bot, "handle_investment_command") as handle:

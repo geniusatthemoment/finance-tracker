@@ -71,6 +71,10 @@ def init_db(connection):
         CREATE TABLE IF NOT EXISTS investment_market_cache (
             cache_key TEXT PRIMARY KEY, fetched_at REAL NOT NULL, data TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS investment_daily_snapshots (
+            chat_id INTEGER NOT NULL, day TEXT NOT NULL, data TEXT NOT NULL,
+            PRIMARY KEY(chat_id, day)
+        );
     """)
 
 
@@ -534,6 +538,67 @@ def forecast(bond, market, asof, target):
     earned = coupons + qty * (end_accrual - start_accrual) if start_accrual is not None and end_accrual is not None and not unknown else None
     return {"entries": entries, "coupons": coupons, "principal": principal, "unknown": unknown,
             "earned": earned, "maturity": maturity}
+
+
+def daily_snapshot(state, markets, observed_at):
+    """Persist comparable valuations; imported ledger changes reset the baseline."""
+    cash, unmatched = cash_by_bond(state, markets)
+    calculated = [results(b, markets[i], cash[i]) for i, b in state['bonds'].items()]
+    if any(r['value'] is None for r in calculated):
+        raise ValueError('Не удалось получить цены всех бумаг. Изменение портфеля не рассчитано.')
+    if any(m['stale'] for i, m in markets.items() if dec(state['bonds'][i]['quantity']) > 0):
+        raise ValueError('MOEX не обновил цены. Чтобы не показать ложное изменение, сегодня сравнение пропущено.')
+    value = sum((r['value'] for r in calculated), Decimal(0))
+    nkd = sum((dec(b['quantity']) * dec(markets[i]['security'].get('ACCRUEDINT') or 0) for i, b in state['bonds'].items()), Decimal(0))
+    ledger = {'bonds': state['bonds'], 'cash': state['cash'], 'asof': state['asof']}
+    # Derived reconciliation fields are deterministic and contain no market prices.
+    fingerprint = hashlib.sha256(json.dumps(ledger, sort_keys=True, default=str).encode()).hexdigest()
+    total = sum((r['total'] for r in calculated), Decimal(0)) if not unmatched and all(r['total'] is not None for r in calculated) else None
+    pending = []
+    observed_day = day(observed_at[:10])
+    for isin, bond in state['bonds'].items():
+        if dec(bond['quantity']) <= 0:
+            continue
+        m = markets[isin]
+        for rows, key in ((m['coupons'], 'coupondate'), (m['amortizations'], 'amortdate')):
+            for event in rows:
+                if event.get(key) and state['asof'] < day(event[key]) <= observed_day:
+                    pending.append((event[key], bond['name']))
+    return {'observed_at': observed_at, 'ledger': fingerprint, 'asof': str(state['asof']),
+            'value': str(value), 'price': str(value - nkd), 'nkd': str(nkd),
+            'total': str(total) if total is not None else None,
+            'coupons': str(sum((r['coupons'] for r in calculated), Decimal(0))),
+            'fees': str(sum((r['fees'] for r in calculated), Decimal(0))),
+            'principal': str(sum((r['principal'] for r in calculated), Decimal(0))),
+            'pending': sorted(set(pending)),
+            'quote_at': sorted({m['quote_at'] for i, m in markets.items() if m['quote_at'] and dec(state['bonds'][i]['quantity']) > 0})}
+
+
+def daily_change_text(current, previous):
+    def signed(value):
+        return ('+' if dec(value) > 0 else '') + rub(value)
+    lines = ['Портфель · утренняя сводка', f"Стоимость бумаг с НКД: {rub(current['value'])}"]
+    comparable = previous and previous['ledger'] == current['ledger']
+    if comparable:
+        start = datetime.fromisoformat(previous['observed_at'])
+        lines.extend([f"Изменение оценки с {start:%d.%m %H:%M}: {signed(dec(current['value']) - dec(previous['value']))}",
+                      f"• Рыночная стоимость без НКД: {signed(dec(current['price']) - dec(previous['price']))}",
+                      f"• Изменение НКД: {signed(dec(current['nkd']) - dec(previous['nkd']))}"])
+    else:
+        lines.append('История операций обновлена — сравнение начнётся со следующей сводки.' if previous else 'Сохранил первую оценку. Изменение покажу в следующей сводке.')
+        lines.extend([f"Рыночная стоимость без НКД: {rub(current['price'])}", f"НКД сейчас: {rub(current['nkd'])}"])
+        for key, label in [('coupons', 'Получено купонов'), ('fees', 'Комиссии сделок'), ('principal', 'Возврат номинала (не прибыль)')]:
+            if dec(current[key]):
+                lines.append(f"{label} за всю загруженную историю: {rub(current[key])}")
+    if current['total'] is not None:
+        lines.append(f"Общий результат с покупки после комиссий: {signed(current['total'])}")
+    relevant_pending = [e for e in current['pending'] if not previous or e[0] > previous['observed_at'][:10]]
+    if relevant_pending:
+        lines.append('По графику были выплаты: ' + ', '.join(sorted({e[1] for e in relevant_pending})) + '. Они не подтверждены отчётом; снижение оценки бумаг не обязательно означает убыток. Обнови XLSX.')
+    if current['quote_at']:
+        lines.append('Котировки: ' + ' — '.join([current['quote_at'][0], current['quote_at'][-1]]) if len(current['quote_at']) > 1 else 'Котировки: ' + current['quote_at'][0])
+    lines.append(f"Операции и выплаты подтверждены по {day(current['asof']):%d.%m.%Y}. Новые купоны и комиссии автоматически не загружаются. Без налогов.")
+    return '\n'.join(lines)
 
 
 def pnl_text(state, markets, cash, unmatched):
