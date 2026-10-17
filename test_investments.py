@@ -46,6 +46,11 @@ def payment(kind="coupon", amount="60", identity="cash1", when="2026-09-29"):
     return {"id": identity, "kind": kind, "amount": amount, "date": when, "regnumber": "TEST-REG", "comment": "Тест 01"}
 
 
+def history_quote(when='2026-10-01', price=98, nkd=10, face=1000):
+    return {'BOARDID':'TQCB', 'TRADEDATE':when, 'CLOSE':price, 'ACCINT':nkd,
+            'FACEVALUE':face, 'FACEUNIT':'RUB', 'NUMTRADES':10, 'TRADINGSESSION':3}
+
+
 class InvestmentsTest(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -299,6 +304,80 @@ class InvestmentsTest(unittest.TestCase):
             text, _ = inv.report_text(c, 1, "/pnl", "", date(2026, 10, 1), SimpleNamespace(all=lambda _: {ISIN: m}))
         self.assertIn("По 0 из 1 облигаций: нет данных", text)
         self.assertIn("часть данных сохранённая", text)
+
+    def test_history_reconstruction_uses_holdings_and_cashflows_on_each_date(self):
+        trades = [trade(), trade(qty='1', amount='1000', nkd='10', fee='3', identity='2', when='2026-10-02')]
+        self.save(report(qty='3', end='2026-10-03', trades=trades, cash=[payment(amount='20', when='2026-10-02')]))
+        rows = inv.reconstruct_month(self.state(), {ISIN:market()}, {ISIN:[history_quote(),history_quote('2026-10-02',99,11)]}, date(2026,10,1), date(2026,10,4))
+        self.assertEqual(len(rows), 3)
+        self.assertTrue(all(r['complete'] for r in rows))
+        self.assertEqual(Decimal(rows[0]['value']), Decimal('1980'))
+        self.assertEqual(Decimal(rows[1]['value']), Decimal('3003'))
+        self.assertEqual(rows[0]['positions'][ISIN]['quantity'], '2')
+        self.assertEqual(rows[1]['positions'][ISIN]['quantity'], '3')
+        self.assertTrue(rows[2]['carried_quotes'])
+        self.assertEqual(rows[2]['positions'][ISIN]['quote_day'], '2026-10-02')
+        text = inv.daily_change_text(rows[1], rows[0])
+        self.assertIn('Цена: +20 ₽ · НКД: +3 ₽', text)
+        self.assertIn('Купоны: +20 ₽ · комиссии: -3 ₽', text)
+        self.assertIn('Итого с закрытия 01.10: +40 ₽', text)
+        self.assertEqual(len(text.splitlines()), 5)
+
+    def test_history_missing_quotes_and_short_history_not_fabricated(self):
+        self.save(report(end='2026-10-03'))
+        rows = inv.reconstruct_month(self.state(), {ISIN:market()}, {}, date(2026,10,1), date(2026,10,4))
+        self.assertTrue(all(not r['complete'] and r['value'] is None for r in rows))
+        state=self.state();state['start']='2026-10-02'
+        rows=inv.reconstruct_month(state,{ISIN:market()},{ISIN:[history_quote()]},date(2026,10,1),date(2026,10,3))
+        self.assertFalse(rows[0]['complete'])
+
+    def test_history_uses_old_nominal_and_stops_before_today_or_report_end(self):
+        self.save(report(end='2026-10-02'))
+        rows=inv.reconstruct_month(self.state(),{ISIN:market()},{ISIN:[history_quote(face=900)]},date(2026,10,1),date(2026,10,17))
+        self.assertEqual([r['day'] for r in rows], ['2026-10-01','2026-10-02'])
+        self.assertEqual(Decimal(rows[0]['price']), Decimal('1764'))
+        rows=inv.reconstruct_month(self.state(),{ISIN:market()},{ISIN:[history_quote()]},date(2026,10,1),date(2026,10,2))
+        self.assertEqual(len(rows),1)
+
+    def test_history_worker_preserves_real_snapshots_and_user_isolation(self):
+        self.save(report(end='2026-10-03'))
+        with self.db() as c:
+            c.execute('INSERT INTO investment_daily_snapshots VALUES (?,?,?)', (1,'2026-10-02','real observation'))
+        with patch.object(inv.Market,'all',return_value={ISIN:market()}), patch.object(inv.Market,'history',return_value=[history_quote()]), patch.object(bot,'send') as send:
+            for _ in range(2):
+                bot.portfolio_history_worker(1,date(2026,10,1),date(2026,10,4))
+            send.assert_not_called()
+        with self.db() as c:
+            self.assertEqual(c.execute('SELECT COUNT(*) FROM investment_daily_history WHERE chat_id=1').fetchone()[0],3)
+            self.assertEqual(c.execute('SELECT COUNT(*) FROM investment_daily_history WHERE chat_id=2').fetchone()[0],0)
+            self.assertEqual(c.execute('SELECT data FROM investment_daily_snapshots').fetchone()[0],'real observation')
+            current={'ledger':inv.ledger_fingerprint(self.state())}
+            previous=inv.previous_snapshot(c,1,date(2026,10,4),current)
+            self.assertEqual(previous['source'],'moex_history_close')
+            self.assertEqual(previous['day'],'2026-10-03')
+
+    def test_history_redemption_and_coupon_are_not_false_losses(self):
+        self.save(report(qty='0', end='2026-10-03', cash=[payment(kind='principal', amount='2000', when='2026-10-02'), payment(amount='30', when='2026-10-02', identity='coupon')]))
+        m=market();m['security']['MATDATE']='2026-10-02'
+        m['amortizations']=[{'amortdate':'2026-10-02','value':1000,'faceunit':'RUB'}]
+        rows=inv.reconstruct_month(self.state(),{ISIN:m},{ISIN:[history_quote()]},date(2026,10,1),date(2026,10,3))
+        self.assertTrue(all(r['complete'] for r in rows))
+        self.assertEqual(rows[1]['value'],'0')
+        text=inv.daily_change_text(rows[1],rows[0])
+        self.assertIn('Цена: +40 ₽ · НКД: -20 ₽',text)
+        self.assertIn('Купоны: +30 ₽',text)
+        self.assertIn('Итого с закрытия 01.10: +50 ₽',text)
+
+    def test_history_api_paginates_and_validates_isin(self):
+        def payload(rows,index,total):
+            return {'history': {'columns':['TRADEDATE'], 'data':[[r] for r in rows]},
+                    'history.cursor':{'columns':['INDEX','PAGESIZE','TOTAL'], 'data':[[index,100,total]]}}
+        market_api=inv.Market(self.db)
+        with patch.object(market_api,'cached',side_effect=[(payload(['2026-10-01']*100,0,101),0,False),(payload(['2026-10-02'],100,101),0,False)]) as fetch:
+            self.assertEqual(len(market_api.history(ISIN,date(2026,10,1),date(2026,10,2))),101)
+            self.assertIn('start=100',fetch.call_args.args[1])
+        with self.assertRaises(ValueError):
+            market_api.history('../bad',date(2026,10,1),date(2026,10,2))
 
     def test_daily_price_and_nkd_changes_reconcile(self):
         self.save(report(cash=[payment()]))

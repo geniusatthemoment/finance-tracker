@@ -78,6 +78,10 @@ def init_db(connection):
             chat_id INTEGER NOT NULL, day TEXT NOT NULL, data TEXT NOT NULL,
             PRIMARY KEY(chat_id, day)
         );
+        CREATE TABLE IF NOT EXISTS investment_daily_history (
+            chat_id INTEGER NOT NULL, day TEXT NOT NULL, data TEXT NOT NULL,
+            PRIMARY KEY(chat_id, day)
+        );
     """)
 
 
@@ -395,6 +399,27 @@ class Market:
                 "coupons": table(schedule, "coupons"), "amortizations": table(schedule, "amortizations"),
                 "offers": table(schedule, "offers"), "description": desc}
 
+    def history(self, isin, start, end):
+        if not ISIN_RE.fullmatch(isin) or start > end:
+            raise ValueError('Некорректный запрос истории MOEX')
+        rows = []
+        for offset in range(0, 10000, 100):
+            path = f'/history/engines/stock/markets/bonds/securities/{isin}.json?from={start}&till={end}&start={offset}&iss.meta=off'
+            data, _, _ = self.cached(f'history:{isin}:{start}:{end}:{offset}', path, 86400)
+            if not data:
+                raise ValueError('MOEX не вернул архив котировок')
+            page = table(data, 'history')
+            rows.extend(page)
+            cursor = table(data, 'history.cursor')
+            if cursor:
+                if cursor[0]['INDEX'] + cursor[0]['PAGESIZE'] >= cursor[0]['TOTAL']:
+                    return rows
+            elif len(page) < 100:
+                return rows
+            if not page:
+                raise ValueError('Архив MOEX загружен не полностью')
+        raise ValueError('Архив MOEX слишком большой')
+
     def all(self, isins):
         with ThreadPoolExecutor(max_workers=4) as pool:
             return dict(zip(isins, pool.map(self.security, isins)))
@@ -543,6 +568,100 @@ def forecast(bond, market, asof, target):
             "earned": earned, "maturity": maturity}
 
 
+def ledger_fingerprint(state):
+    ledger = {'bonds': state['bonds'], 'cash': state['cash'], 'asof': state['asof']}
+    return hashlib.sha256(json.dumps(ledger, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def ledger_totals(state, through):
+    trades = [t for b in state['bonds'].values() for t in b['trades'].values() if day(t['settled']) <= through]
+    payouts = [p for p in state['cash'].values() if day(p['date']) <= through]
+    def signed_trade(t, field):
+        return (Decimal(-1) if dec(t['quantity']) > 0 else Decimal(1)) * dec(t[field])
+    return {
+        'net_clean_trades': str(sum((signed_trade(t, 'amount') - signed_trade(t, 'nkd') for t in trades), Decimal(0))),
+        'net_nkd_trades': str(sum((signed_trade(t, 'nkd') for t in trades), Decimal(0))),
+        'fees': str(sum((dec(t['fee']) for t in trades), Decimal(0))),
+        'coupons': str(sum((dec(p['amount']) for p in payouts if p['kind'] == 'coupon'), Decimal(0))),
+        'principal': str(sum((dec(p['amount']) for p in payouts if p['kind'] == 'principal'), Decimal(0))),
+    }
+
+
+def reconstruct_month(state, markets, histories, month_start, today):
+    """End-of-session estimates, never fabricated intraday observations."""
+    last = min(today - timedelta(days=1), state['asof'], (month_start + timedelta(days=32)).replace(day=1) - timedelta(days=1))
+    payments, unmatched = cash_by_bond(state, markets)
+    fingerprint = ledger_fingerprint(state)
+    rows = []
+    on = month_start
+    while on <= last:
+        errors, positions = [], {}
+        if on < day(state['start']):
+            errors.append('Дата раньше начала загруженной истории')
+        price, nkd = Decimal(0), Decimal(0)
+        for isin, bond in state['bonds'].items():
+            if not bond.get('history_complete'):
+                errors.append(isin + ': неполная история количества')
+                continue
+            qty = dec(bond['opening']) + sum((dec(t['quantity']) for t in bond['trades'].values() if day(t['settled']) <= on), Decimal(0))
+            m = markets[isin]
+            if bond['expected_quantity'] != dec(bond['quantity']) and not results(bond, m, payments[isin])['complete']:
+                errors.append(isin + ': остаток не сверяется с отчётом')
+                continue
+            maturity = m['security'].get('MATDATE') or m['description'].get('MATDATE')
+            if maturity and maturity != '0000-00-00' and day(maturity) <= on and qty:
+                if dec(bond['quantity']) == 0 and results(bond, m, payments[isin])['complete']:
+                    qty = Decimal(0)
+                else:
+                    errors.append(isin + ': погашение не сверено')
+                    continue
+            if qty < 0:
+                errors.append(isin + ': отрицательный остаток')
+                continue
+            if qty == 0:
+                continue
+            board = m['security'].get('BOARDID')
+            candidates = [r for r in histories.get(isin, []) if r.get('TRADEDATE') and day(r['TRADEDATE']) <= on
+                          and ((r.get('BOARDID') == board) if board else str(r.get('BOARDID', '')).startswith('TQ'))
+                          and r.get('CLOSE') is not None and r.get('ACCINT') is not None and r.get('FACEVALUE') is not None
+                          and r.get('FACEUNIT') in ('RUB', 'SUR')]
+            if not candidates:
+                errors.append(isin + ': нет архивной цены/НКД/номинала')
+                continue
+            quote = max(candidates, key=lambda r: (r['TRADEDATE'], r.get('TRADINGSESSION') == 3, r.get('NUMTRADES') or 0))
+            clean = qty * dec(quote['CLOSE']) / 100 * dec(quote['FACEVALUE'])
+            accrued = qty * dec(quote['ACCINT'])
+            price += clean; nkd += accrued
+            positions[isin] = {'quantity': str(qty), 'price': str(clean), 'nkd': str(accrued),
+                               'quote_day': quote['TRADEDATE'], 'board': quote['BOARDID'], 'facevalue': str(quote['FACEVALUE'])}
+        if unmatched:
+            errors.append('Есть несопоставленные выплаты')
+        data = {'source': 'moex_history_close', 'day': on.isoformat(), 'ledger': fingerprint, 'asof': str(state['asof']),
+                'observed_at': on.isoformat() + 'T23:59:59+03:00', 'positions': positions,
+                'complete': not errors, 'errors': errors, 'value': str(price + nkd) if not errors else None,
+                'price': str(price) if not errors else None, 'nkd': str(nkd) if not errors else None,
+                'pending': [], 'quote_at': sorted({p['quote_day'] for p in positions.values()}),
+                'total': None, **ledger_totals(state, on)}
+        data['carried_quotes'] = any(p['quote_day'] != on.isoformat() for p in positions.values())
+        rows.append(data)
+        on += timedelta(days=1)
+    return rows
+
+
+def previous_snapshot(connection, chat_id, today, current, include_today=False):
+    # A reconstructed close is preferable to a morning observation for "today".
+    archived = connection.execute('SELECT data FROM investment_daily_history WHERE chat_id=? AND day=?',
+                                  (chat_id, (today - timedelta(days=1)).isoformat())).fetchone()
+    if archived:
+        data = json.loads(archived[0])
+        if data.get('complete') and data['ledger'] == current['ledger']:
+            return data
+    row = connection.execute('''SELECT data FROM investment_daily_snapshots WHERE chat_id=? AND day<=?
+        ORDER BY CASE WHEN day<? THEN 0 ELSE 1 END, day DESC LIMIT 1''',
+        (chat_id, (today if include_today else today-timedelta(days=1)).isoformat(), today.isoformat())).fetchone()
+    return json.loads(row[0]) if row else None
+
+
 def daily_snapshot(state, markets, observed_at):
     """Persist comparable valuations; imported ledger changes reset the baseline."""
     cash, unmatched = cash_by_bond(state, markets)
@@ -553,9 +672,7 @@ def daily_snapshot(state, markets, observed_at):
         raise ValueError('MOEX не обновил цены. Чтобы не показать ложное изменение, сегодня сравнение пропущено.')
     value = sum((r['value'] for r in calculated), Decimal(0))
     nkd = sum((dec(b['quantity']) * dec(markets[i]['security'].get('ACCRUEDINT') or 0) for i, b in state['bonds'].items()), Decimal(0))
-    ledger = {'bonds': state['bonds'], 'cash': state['cash'], 'asof': state['asof']}
-    # Derived reconciliation fields are deterministic and contain no market prices.
-    fingerprint = hashlib.sha256(json.dumps(ledger, sort_keys=True, default=str).encode()).hexdigest()
+    fingerprint = ledger_fingerprint(state)
     total = sum((r['total'] for r in calculated), Decimal(0)) if not unmatched and all(r['total'] is not None for r in calculated) else None
     pending = []
     observed_day = day(observed_at[:10])
@@ -574,7 +691,8 @@ def daily_snapshot(state, markets, observed_at):
             'fees': str(sum((r['fees'] for r in calculated), Decimal(0))),
             'principal': str(sum((r['principal'] for r in calculated), Decimal(0))),
             'pending': sorted(set(pending)),
-            'quote_at': sorted({m['quote_at'] for i, m in markets.items() if m['quote_at'] and dec(state['bonds'][i]['quantity']) > 0})}
+            'quote_at': sorted({m['quote_at'] for i, m in markets.items() if m['quote_at'] and dec(state['bonds'][i]['quantity']) > 0}),
+            **ledger_totals(state, state['asof'])}
 
 
 def daily_change_text(current, previous):
@@ -589,12 +707,17 @@ def daily_change_text(current, previous):
     comparable = previous is not None and previous['ledger'] == current['ledger']
     lines = [f'{at.day} {months[at.month - 1]} · портфель',
              f"Было {money(previous['value']) if comparable else '—'} → стало {money(current['value'])}"]
+    def change(key):
+        return dec(current[key]) - dec(previous[key]) if comparable and key in previous and key in current else Decimal(0)
+    price_change = change('price') + change('net_clean_trades') + change('principal')
+    nkd_change = change('nkd') + change('net_nkd_trades')
+    coupons_change, fees_change = change('coupons'), change('fees')
     if comparable:
-        lines.append(f"Цена: {signed(dec(current['price']) - dec(previous['price']))} · НКД: {signed(dec(current['nkd']) - dec(previous['nkd']))}")
+        lines.append(f"Цена: {signed(price_change)} · НКД: {signed(nkd_change)}")
     else:
         lines.append('Цена: — · НКД: — (нет сравнения)')
     if comparable and day(current['asof']) >= at.date():
-        lines.append('Купоны: 0 ₽ · комиссии: 0 ₽')
+        lines.append(f'Купоны: {signed(coupons_change)} · комиссии: {signed(-fees_change)}')
     else:
         lines.append(f"Купоны/комиссии: нет новых данных после {day(current['asof']):%d.%m}")
     pending = [e for e in current['pending'] if not previous or e[0] > previous['observed_at'][:10]]
@@ -604,9 +727,9 @@ def daily_change_text(current, previous):
         lines.append('Итого: — · выплата по графику не подтверждена; обнови XLSX')
     else:
         start = datetime.fromisoformat(previous['observed_at'])
-        period = 'за день' if (at.date() - start.date()).days == 1 else f'с {start:%d.%m %H:%M}'
+        period = f"с закрытия {start:%d.%m}" if previous.get('source') == 'moex_history_close' else ('за день' if (at.date() - start.date()).days == 1 else f'с {start:%d.%m %H:%M}')
         qualifier = '' if day(current['asof']) >= at.date() else ' (только цена и НКД)'
-        lines.append(f"Итого {period}: {signed(dec(current['value']) - dec(previous['value']))}{qualifier}")
+        lines.append(f"Итого {period}: {signed(price_change + nkd_change + coupons_change - fees_change)}{qualifier}")
     return '\n'.join(lines)
 
 
@@ -729,16 +852,12 @@ def report_text(connection, chat_id, command, argument, today, market, detailed=
         bonds = {matches[0]: bonds[matches[0]]}
     markets = market.all(list(state["bonds"]))
     if command == '/portfolio_day':
-        previous = connection.execute(
-            '''SELECT data FROM investment_daily_snapshots WHERE chat_id=? AND day<=?
-               ORDER BY CASE WHEN day<? THEN 0 ELSE 1 END, day DESC LIMIT 1''',
-            (chat_id, today.isoformat(), today.isoformat()),
-        ).fetchone()
         current = daily_snapshot(state, markets, observed_at or today.isoformat() + 'T10:00:00')
+        previous = previous_snapshot(connection, chat_id, today, current, include_today=True)
         if previous is None:
             connection.execute('INSERT OR IGNORE INTO investment_daily_snapshots VALUES (?,?,?)',
                                (chat_id, today.isoformat(), json.dumps(current, ensure_ascii=False)))
-        return daily_change_text(current, json.loads(previous[0]) if previous else None), MENU
+        return daily_change_text(current, previous), MENU
     cash, unmatched = cash_by_bond(state, markets)
     if command == "/pnl" or (command == "/profit" and not detailed):
         return pnl_text(state, markets, cash, unmatched), {"inline_keyboard": [[{"text": "Подробнее по каждой облигации", "callback_data": "investdetail:profit:"}]]}

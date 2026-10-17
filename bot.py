@@ -1759,7 +1759,10 @@ def handle_investment_document(chat_id, document):
             send(chat_id, "Этот брокерский отчёт уже импортирован. Дубликатов нет.")
             return
         send(chat_id, f"Отчёт по {investments.day(report['end']):%d.%m.%Y} сохранён. Выпусков: {len(report['bonds'])}. Траты не изменены.\nЗагружаю данные MOEX…")
-        handle_investment_command(chat_id, "/portfolio", get_user(chat_id))
+        imported_user = get_user(chat_id)
+        calendar_today = user_calendar_today(imported_user)
+        queue_portfolio_history(chat_id, calendar_today.replace(day=1), calendar_today)
+        handle_investment_command(chat_id, "/portfolio", imported_user)
     except (urllib.error.URLError, TimeoutError):
         send(chat_id, "Не удалось скачать XLSX. Попробуй ещё раз.")
     except ValueError as error:
@@ -2926,24 +2929,102 @@ def send_daily_profit(user, day):
 
 
 INVESTMENT_DAILY_PENDING = set()
+INVESTMENT_HISTORY_PENDING = set()
+
+
+def portfolio_history_worker(chat_id, month_start, today, request_key=None):
+    try:
+        with db() as connection:
+            state = investments.portfolio(connection, chat_id)
+        if not state:
+            return
+        market = investments.Market(db)
+        markets = market.all(list(state['bonds']))
+        end = min(today - timedelta(days=1), state['asof'])
+        def fetch(isin):
+            try:
+                return isin, market.history(isin, month_start - timedelta(days=40), end)
+            except (ValueError, OSError):
+                return isin, []
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            histories = dict(pool.map(fetch, state['bonds']))
+        rows = investments.reconstruct_month(state, markets, histories, month_start, today)
+        with db() as connection:
+            latest = investments.portfolio(connection, chat_id)
+            if not latest or investments.ledger_fingerprint(latest) != investments.ledger_fingerprint(state):
+                raise ValueError('Во время расчёта обновился отчёт. Запусти восстановление повторно.')
+            for row in rows:
+                connection.execute('''INSERT INTO investment_daily_history VALUES (?,?,?)
+                    ON CONFLICT(chat_id,day) DO UPDATE SET data=excluded.data''',
+                    (chat_id, row['day'], json.dumps(row, ensure_ascii=False)))
+        count = sum(r['complete'] for r in rows)
+        first, last = (rows[0]['day'], rows[-1]['day']) if rows else ('—', '—')
+        print(f'Portfolio history backfilled: complete={count} incomplete={len(rows)-count} first={first} last={last}', flush=True)
+        if request_key:
+            text = f'История портфеля за {month_start:%m.%Y}: восстановлено {count} из {len(rows)} дней.\nРеальные снимки и траты не изменены.\nСегодняшнее изменение: /portfolio_day'
+            if count < len(rows):
+                text += '\nДля части дат не хватает архивных данных — нули вместо них не подставлены.'
+            if send(chat_id, text) is not None:
+                mark_sent(chat_id, today, request_key)
+                print('Portfolio history request completed', flush=True)
+    except Exception as error:
+        print('Portfolio history failed:', type(error).__name__, flush=True)
+        if request_key:
+            send(chat_id, 'Не удалось восстановить историю портфеля. Текущие снимки и траты не изменены.')
+    finally:
+        with INVESTMENT_LOCK:
+            INVESTMENT_HISTORY_PENDING.discard(chat_id)
+
+
+def queue_portfolio_history(chat_id, month_start, today, request_key=None):
+    with INVESTMENT_LOCK:
+        if chat_id in INVESTMENT_HISTORY_PENDING:
+            return
+        INVESTMENT_HISTORY_PENDING.add(chat_id)
+    try:
+        INVESTMENT_WORKERS.submit(portfolio_history_worker, chat_id, month_start, today, request_key)
+    except Exception:
+        with INVESTMENT_LOCK:
+            INVESTMENT_HISTORY_PENDING.discard(chat_id)
+        raise
+
+
+def dispatch_portfolio_history():
+    target = os.environ.get('PORTFOLIO_HISTORY_CHAT_ID', '')
+    month = os.environ.get('PORTFOLIO_HISTORY_MONTH', '')
+    request = os.environ.get('PORTFOLIO_HISTORY_REQUEST', '')
+    if not target.isdigit() or not re.fullmatch(r'\d{4}-\d{2}', month) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', request):
+        return
+    chat_id = int(target)
+    if chat_id not in ALLOWED_USER_IDS:
+        return
+    try:
+        month_start = date.fromisoformat(month + '-01')
+    except ValueError:
+        return
+    user = get_user(chat_id)
+    if not user or month_start > user_calendar_today(user):
+        return
+    key = 'portfolio_history:' + request
+    with db() as connection:
+        if connection.execute('SELECT 1 FROM sent_messages WHERE chat_id=? AND message_type=? LIMIT 1', (chat_id,key)).fetchone():
+            return
+    queue_portfolio_history(chat_id, month_start, user_calendar_today(user), key)
 
 
 def investment_daily_worker(chat_id, today, observed_at, notify=True):
     try:
         with db() as connection:
             state = investments.portfolio(connection, chat_id)
-            previous = connection.execute(
-                'SELECT data FROM investment_daily_snapshots WHERE chat_id=? AND day<? ORDER BY day DESC LIMIT 1',
-                (chat_id, today.isoformat()),
-            ).fetchone()
         if not state:
             return
         snapshot = investments.daily_snapshot(state, investments.Market(db).all(list(state['bonds'])), observed_at)
         with db() as connection:
+            previous = investments.previous_snapshot(connection, chat_id, today, snapshot)
             connection.execute('INSERT INTO investment_daily_snapshots VALUES (?,?,?) ON CONFLICT(chat_id,day) DO UPDATE SET data=excluded.data',
                                (chat_id, today.isoformat(), json.dumps(snapshot, ensure_ascii=False)))
         print('Investment daily snapshot saved:', today.isoformat(), flush=True)
-        if notify and send(chat_id, investments.daily_change_text(snapshot, json.loads(previous[0]) if previous else None), investments.MENU) is not None:
+        if notify and send(chat_id, investments.daily_change_text(snapshot, previous), investments.MENU) is not None:
             mark_sent(chat_id, today, 'investment_daily')
     except ValueError as error:
         if notify and send(chat_id, 'Портфель · утренняя сводка\n' + str(error)) is not None:
@@ -3056,6 +3137,7 @@ def main():
         raise SystemExit(1)
     ZoneInfo(DEFAULT_TIMEZONE)  # fail early on a typo
     init_db()
+    dispatch_portfolio_history()
     dispatch_portfolio_preview()
     print("Bot is running. Press Ctrl+C to stop.")
     offset = 0
