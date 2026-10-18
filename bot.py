@@ -3018,9 +3018,11 @@ def investment_daily_worker(chat_id, today, observed_at, notify=True):
             state = investments.portfolio(connection, chat_id)
         if not state:
             return
-        snapshot = investments.daily_snapshot(state, investments.Market(db).all(list(state['bonds'])), observed_at)
+        market = investments.Market(db)
+        markets = market.all(list(state['bonds']))
+        snapshot = investments.daily_snapshot(state, markets, observed_at)
+        previous = investments.yesterday_valuation(state, markets, market, today) if notify else None
         with db() as connection:
-            previous = investments.previous_snapshot(connection, chat_id, today, snapshot)
             connection.execute('INSERT INTO investment_daily_snapshots VALUES (?,?,?) ON CONFLICT(chat_id,day) DO UPDATE SET data=excluded.data',
                                (chat_id, today.isoformat(), json.dumps(snapshot, ensure_ascii=False)))
         print('Investment daily snapshot saved:', today.isoformat(), flush=True)

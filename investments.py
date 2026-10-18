@@ -721,6 +721,35 @@ def daily_snapshot(state, markets, observed_at):
             **ledger_totals(state, state['asof'])}
 
 
+def yesterday_valuation(state, markets, market, today):
+    """Reprice today's holdings on yesterday, without snapshot/version gates."""
+    yesterday = today - timedelta(days=1)
+    held = [(i, b) for i, b in state['bonds'].items() if dec(b['quantity']) > 0]
+    def value_position(item):
+        isin, bond = item
+        m = markets[isin]
+        rows = market.history(isin, yesterday - timedelta(days=40), yesterday)
+        board = m['security'].get('BOARDID')
+        candidates = [r for r in rows if r.get('TRADEDATE') and day(r['TRADEDATE']) <= yesterday
+                      and (r.get('BOARDID') == board if board else str(r.get('BOARDID','')).startswith('TQ'))
+                      and r.get('CLOSE') is not None and r.get('FACEVALUE') is not None and r.get('FACEUNIT') in ('RUB','SUR')]
+        if not candidates:
+            raise ValueError('Нет архивной цены за вчера: ' + bond['name'])
+        quote = max(candidates, key=lambda r:(r['TRADEDATE'],r.get('TRADINGSESSION') == 3,r.get('NUMTRADES') or 0))
+        accrued = calendar_accrual(m, yesterday)
+        if accrued is None:
+            raise ValueError('Нет графика для НКД за вчера: ' + bond['name'])
+        qty = dec(bond['quantity'])
+        return qty * dec(quote['CLOSE']) / 100 * dec(quote['FACEVALUE']), qty * accrued, quote['TRADEDATE']
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        values = list(pool.map(value_position, held))
+    price = sum((v[0] for v in values),Decimal(0))
+    nkd = sum((v[1] for v in values),Decimal(0))
+    return {'source':'same_holdings_yesterday','observed_at':yesterday.isoformat()+'T23:59:59+03:00',
+            'nkd_basis':'calendar_v1','ledger':ledger_fingerprint(state),'value':str(price+nkd),
+            'price':str(price),'nkd':str(nkd),'quote_at':sorted({v[2] for v in values})}
+
+
 def daily_change_text(current, previous):
     def money(value):
         return rub(value).replace('.00 ₽', ' ₽')
@@ -730,41 +759,32 @@ def daily_change_text(current, previous):
 
     at = datetime.fromisoformat(current['observed_at'])
     months = ('января', 'февраля', 'марта', 'апреля', 'мая', 'июня', 'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря')
-    same_basis = previous is not None and previous.get('nkd_basis') == current.get('nkd_basis')
     adjacent = previous is not None and (at.date() - day(previous['observed_at'][:10])).days == 1
-    comparable = previous is not None and previous['ledger'] == current['ledger'] and same_basis and adjacent
+    comparable = previous is not None and adjacent and all(previous.get(k) is not None for k in ('value','price','nkd'))
     lines = [f'{at.day} {months[at.month - 1]} · портфель',
              f"Было {money(previous['value']) if comparable else '—'} → стало {money(current['value'])}"]
     def change(key):
         return dec(current[key]) - dec(previous[key]) if comparable and key in previous and key in current else Decimal(0)
-    price_change = change('price') + change('net_clean_trades') + change('principal')
-    nkd_change = change('nkd') + change('net_nkd_trades')
-    coupons_change, fees_change = change('coupons'), change('fees')
+    price_change = change('price')
+    nkd_change = change('nkd')
     if comparable:
         lines.append(f"Цена: {signed(price_change)} · НКД: {signed(nkd_change)}")
     else:
         lines.append('Цена: — · НКД: — (нет сравнения)')
-    if comparable and day(current['asof']) >= at.date():
-        lines.append(f'Купоны: {signed(coupons_change)} · комиссии: {signed(-fees_change)}')
+    if comparable:
+        lines.append(f"НКД: {money(previous['nkd'])} → {money(current['nkd'])}")
     else:
-        lines.append(f"Купоны/комиссии: нет новых данных после {day(current['asof']):%d.%m}")
+        lines.append(f"НКД сейчас: {money(current['nkd'])}")
     pending = [e for e in current['pending'] if not previous or e[0] > previous['observed_at'][:10]]
     if not comparable:
-        if previous and not same_basis:
-            lines.append('Итого: — · обновлён расчёт НКД, новая точка отсчёта')
-        elif previous and previous['ledger'] != current['ledger']:
-            lines.append('Итого: — · обновлён отчёт, новая точка отсчёта')
-        elif previous:
+        if previous:
             lines.append('Итого: — · нет оценки за вчера, изменение за сутки недоступно')
         else:
             lines.append('Итого: — · первая оценка, сравнение со следующей сводки')
-    elif pending:
-        lines.append('Итого: — · выплата по графику не подтверждена; обнови XLSX')
     else:
-        start = datetime.fromisoformat(previous['observed_at'])
-        period = f"с закрытия {start:%d.%m}" if previous.get('source') == 'moex_history_close' else ('за день' if (at.date() - start.date()).days == 1 else f'с {start:%d.%m %H:%M}')
-        qualifier = '' if day(current['asof']) >= at.date() else ' (только цена и НКД)'
-        lines.append(f"Итого {period}: {signed(price_change + nkd_change + coupons_change - fees_change)}{qualifier}")
+        if pending:
+            lines[3] += ' · выплата по графику отдельно'
+        lines.append(f"Итого за день: {signed(price_change + nkd_change)}")
     return '\n'.join(lines)
 
 
@@ -888,7 +908,7 @@ def report_text(connection, chat_id, command, argument, today, market, detailed=
     markets = market.all(list(state["bonds"]))
     if command == '/portfolio_day':
         current = daily_snapshot(state, markets, observed_at or today.isoformat() + 'T10:00:00')
-        previous = previous_snapshot(connection, chat_id, today, current, include_today=True)
+        previous = yesterday_valuation(state, markets, market, today)
         if previous is None:
             connection.execute('INSERT OR IGNORE INTO investment_daily_snapshots VALUES (?,?,?)',
                                (chat_id, today.isoformat(), json.dumps(current, ensure_ascii=False)))
