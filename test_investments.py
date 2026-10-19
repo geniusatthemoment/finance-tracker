@@ -374,6 +374,57 @@ class InvestmentsTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             market_api.history('../bad',date(2026,10,1),date(2026,10,2))
 
+    def test_coupon_income_daily_rate_uses_period_not_purchase_day(self):
+        self.save(report(qty='10',trades=[trade(qty='10',nkd='200',when='2026-09-20')]))
+        data=inv.coupon_income_per_day(self.state(),{ISIN:market()},'2026-09-25T10:00:00+07:00')
+        self.assertEqual(Decimal(data['total']),Decimal('10'))
+        e=data['entries'][0]
+        self.assertEqual(Decimal(e['per_bond']),Decimal('1'))
+        self.assertEqual(e['days'],30)
+        self.assertEqual(e['first_purchase'],'2026-09-20')
+        self.assertEqual(e['paid_nkd'],'200')
+        self.assertIn('не твой заработок',inv.daily_income_text(data,'Тест'))
+        # Coupon rollover starts the next rate; receiving a coupon is not a loss.
+        rollover=inv.coupon_income_per_day(self.state(),{ISIN:market()},'2026-10-01T10:00:00+07:00')
+        self.assertGreater(Decimal(rollover['total']),0)
+
+    def test_coupon_income_unknown_amount_is_not_zero_or_full_total(self):
+        self.save(); m=market();m['coupons'][1]['value']=None
+        data=inv.coupon_income_per_day(self.state(),{ISIN:m},'2026-10-19T10:00:00+07:00')
+        self.assertIsNone(data['total'])
+        self.assertIsNone(data['entries'][0]['per_day'])
+        self.assertIn('это не весь портфель',inv.daily_income_text(data))
+
+    def test_hourly_income_cache_refreshes_each_hour_and_when_holdings_change(self):
+        self.save(); state=self.state();m=market()
+        with self.db() as c:
+            first=inv.hourly_income(c,1,state,{ISIN:m},'2026-10-19T10:00:00+07:00')
+            m['coupons'][1]['value']=180
+            same=inv.hourly_income(c,1,state,{ISIN:m},'2026-10-19T10:59:00+07:00')
+            self.assertEqual(first,same)
+            new=inv.hourly_income(c,1,state,{ISIN:m},'2026-10-19T11:00:00+07:00')
+            self.assertEqual(Decimal(new['total']),Decimal(first['total'])*2)
+            self.assertIsNone(c.execute('SELECT data FROM investment_income_hourly WHERE chat_id=2').fetchone())
+        self.assertEqual(inv.command_text('доход в день'),'/daily_income')
+
+    def test_hourly_scheduler_deduplicates_without_sending_messages(self):
+        self.save(); user={'chat_id':1};at=datetime.fromisoformat('2026-10-19T10:00:00+07:00')
+        with patch.object(bot,'ALLOWED_USER_IDS',{1}),patch.object(bot.INVESTMENT_WORKERS,'submit') as submit,patch.object(bot,'send') as send:
+            try:
+                bot.schedule_investment_income(user,at)
+                bot.schedule_investment_income(user,at)
+                self.assertEqual(submit.call_count,1)
+                send.assert_not_called()
+                bot.INVESTMENT_INCOME_PENDING.discard(1)
+                with self.db() as c:
+                    inv.hourly_income(c,1,self.state(),{ISIN:market()},at.isoformat())
+                bot.schedule_investment_income(user,at)
+                self.assertEqual(submit.call_count,1)
+                bot.schedule_investment_income(user,datetime.fromisoformat('2026-10-19T11:00:00+07:00'))
+                self.assertEqual(submit.call_count,2)
+            finally:
+                bot.INVESTMENT_INCOME_PENDING.discard(1)
+
     def test_daily_price_and_nkd_changes_reconcile(self):
         self.save(report(cash=[payment()]))
         state = self.state(); m = market()
@@ -506,7 +557,7 @@ class InvestmentsTest(unittest.TestCase):
             send.assert_not_called()
             bot.investment_daily_worker(1, date(2026,10,2), '2026-10-02T10:00:00+07:00')
             self.assertTrue(bot.was_sent(1, date(2026,10,2), 'investment_daily'))
-            self.assertIn('Итого за день:', send.call_args.args[1])
+            self.assertIn('Итого за день (расчёт):', send.call_args.args[1])
             self.assertEqual(len(send.call_args.args[1].splitlines()), 5)
         with self.db() as c:
             self.assertEqual(c.execute('SELECT COUNT(*) FROM investment_daily_snapshots WHERE chat_id=1').fetchone()[0], 2)
@@ -539,10 +590,10 @@ class InvestmentsTest(unittest.TestCase):
         with self.db() as c:
             c.execute('INSERT INTO investment_daily_snapshots VALUES (?,?,?)',(1,'2026-10-17',json.dumps({'ledger':'legacy','value':'1','nkd_basis':'old'})))
             text,_=inv.report_text(c,1,'/portfolio_day','',date(2026,10,18),api,observed_at='2026-10-18T10:00:00+07:00')
-        self.assertIn('Было 1 992 ₽ → стало 2 014 ₽',text)
-        self.assertIn('Цена: +20 ₽ · НКД: +2 ₽',text)
-        self.assertIn('НКД: 32 ₽ → 34 ₽',text)
-        self.assertIn('Итого за день: +22 ₽',text)
+        self.assertIn('Цена бумаг: 1 960 ₽ → 1 980 ₽',text)
+        self.assertIn('Цена: +20 ₽ · НКД/день: +2 ₽',text)
+        self.assertIn('По каждой бумаге: /daily_income',text)
+        self.assertIn('Итого за день (расчёт): +22 ₽',text)
         self.assertEqual(len(text.splitlines()),5)
         self.assertNotIn('новая точка отсчёта',text)
 
@@ -561,8 +612,8 @@ class InvestmentsTest(unittest.TestCase):
             text, keyboard = inv.report_text(c, 1, '/portfolio_day', '', date(2026,10,1), SimpleNamespace(all=lambda _: {ISIN:m},history=lambda *args:[history_quote('2026-09-30')]), observed_at='2026-10-01T14:00:00+07:00')
             saved = json.loads(c.execute('SELECT data FROM investment_daily_snapshots WHERE chat_id=1').fetchone()[0])
             self.assertEqual(saved, json.loads(json.dumps(first)))
-            self.assertIn('Цена: +20 ₽ · НКД: -58 ₽', text)
-            self.assertIn('Итого за день: -38 ₽', text)
+            self.assertIn('Цена: +20 ₽ · НКД/день: +1.98 ₽', text)
+            self.assertIn('Итого за день (расчёт): +21.98 ₽', text)
             self.assertIsNotNone(keyboard)
         self.assertFalse(bot.was_sent(1,date(2026,10,1),'investment_daily'))
         self.assertEqual(inv.command_text('сводка портфеля'), '/portfolio_day')

@@ -24,12 +24,13 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 ISS = "https://iss.moex.com/iss"
 MAX_FILE = 10_000_000
 ISIN_RE = re.compile(r"^[A-Z]{2}[A-Z0-9]{9}\d$")
-COMMANDS = {"/portfolio", "/portfolio_day", "/profit", "/pnl", "/forecast", "/maturity", "/bond", "/payments", "/invest", "/invest_import"}
+COMMANDS = {"/portfolio", "/portfolio_day", "/daily_income", "/profit", "/pnl", "/forecast", "/maturity", "/bond", "/payments", "/invest", "/invest_import"}
 HELP = (
     "Твои облигации\n\n"
     "/pnl — сколько заработал или потерял\n"
     "/portfolio — что у тебя куплено\n"
     "/portfolio_day — утренняя сводка портфеля сейчас\n"
+    "/daily_income — купонный доход в день по каждой бумаге\n"
     "/forecast 31.12.2026 — сколько получишь к дате\n"
     "/maturity — сколько заработаешь до погашения\n"
     "/payments — когда ближайшие выплаты\n"
@@ -41,6 +42,7 @@ MENU = {"inline_keyboard": [
     [{"text": "Сколько заработал", "callback_data": "investcmd:pnl"}],
     [{"text": "Мои облигации", "callback_data": "investcmd:portfolio"}],
     [{"text": "Изменение за день", "callback_data": "investcmd:portfolio_day"}],
+    [{"text": "Купоны в день", "callback_data": "investcmd:daily_income"}],
     [{"text": "До погашения", "callback_data": "investcmd:maturity"},
      {"text": "Ближайшие выплаты", "callback_data": "investcmd:payments"}],
     [{"text": "До какой даты?", "callback_data": "investcmd:forecast"}],
@@ -52,7 +54,8 @@ def command_text(text):
     normalized = text.strip().casefold()
     aliases = {"облигации": "/invest", "мои облигации": "/portfolio", "сколько заработал": "/pnl",
                "прибыль по облигациям": "/pnl", "до погашения": "/maturity", "ближайшие выплаты": "/payments",
-               "сводка портфеля": "/portfolio_day", "изменение портфеля": "/portfolio_day"}
+               "сводка портфеля": "/portfolio_day", "изменение портфеля": "/portfolio_day",
+               "доход в день": "/daily_income", "доход по купонам": "/daily_income"}
     if normalized in aliases:
         return aliases[normalized]
     match = re.fullmatch(r"(?:до|прогноз)\s+(\d{1,2}\.\d{1,2}\.\d{4})", normalized)
@@ -81,6 +84,9 @@ def init_db(connection):
         CREATE TABLE IF NOT EXISTS investment_daily_history (
             chat_id INTEGER NOT NULL, day TEXT NOT NULL, data TEXT NOT NULL,
             PRIMARY KEY(chat_id, day)
+        );
+        CREATE TABLE IF NOT EXISTS investment_income_hourly (
+            chat_id INTEGER PRIMARY KEY, hour TEXT NOT NULL, ledger TEXT NOT NULL, data TEXT NOT NULL
         );
     """)
 
@@ -392,7 +398,7 @@ class Market:
         price = last if last is not None else security.get("PREVPRICE")
         stamp = md.get("SYSTIME") if last is not None else security.get("PREVDATE")
         schedule, sfetched, sstale = self.cached("schedule:" + isin,
-            f"/securities/{quoted}/bondization.json?iss.meta=off&limit=unlimited", 86400)
+            f"/securities/{quoted}/bondization.json?iss.meta=off&limit=unlimited", 3600)
         desc = {r["name"]: r["value"] for r in table(description, "description")}
         return {"security": security, "price": price, "quote_at": stamp, "fetched": fetched,
                 "stale": stale or desc_stale, "schedule_stale": sstale, "schedule_at": sfetched,
@@ -750,6 +756,80 @@ def yesterday_valuation(state, markets, market, today):
             'price':str(price),'nkd':str(nkd),'quote_at':sorted({v[2] for v in values})}
 
 
+def coupon_income_per_day(state, markets, observed_at):
+    """Known current coupon / actual calendar period; not cash paid each day."""
+    on = day(observed_at[:10])
+    entries = []
+    for isin, bond in state['bonds'].items():
+        qty = dec(bond['quantity'])
+        if qty <= 0:
+            continue
+        m = markets[isin]
+        entry = {'isin': isin, 'name': bond['name'], 'quantity': str(qty), 'per_bond': None, 'per_day': None}
+        buys = [t for t in bond['trades'].values() if dec(t['quantity']) > 0]
+        entry['first_purchase'] = min((t['settled'] for t in buys), default=None)
+        entry['paid_nkd'] = str(sum((dec(t['nkd']) for t in buys), Decimal(0)))
+        maturity = m['security'].get('MATDATE') or m['description'].get('MATDATE')
+        if maturity and maturity != '0000-00-00' and on >= day(maturity):
+            entry.update(per_bond='0', per_day='0', reason='Срок обращения завершён')
+        elif m.get('schedule_stale'):
+            entry['reason'] = 'Не удалось обновить купонный график'
+        else:
+            periods = [r for r in m['coupons'] if r.get('startdate') and r.get('coupondate')
+                       and day(r['startdate']) <= on < day(r['coupondate'])]
+            row = periods[0] if len(periods) == 1 else None
+            value = payment_value(row) if row else None
+            if row is None or value is None:
+                entry['reason'] = 'Неизвестен купон или текущий купонный период'
+            else:
+                days = (day(row['coupondate']) - day(row['startdate'])).days
+                rate = value / Decimal(days)
+                entry.update(per_bond=str(rate), per_day=str(rate * qty), coupon=str(value),
+                             days=days, period_start=row['startdate'], period_end=row['coupondate'])
+        entries.append(entry)
+    known = sum((dec(e['per_day']) for e in entries if e['per_day'] is not None), Decimal(0))
+    complete = all(e['per_day'] is not None for e in entries)
+    return {'observed_at': observed_at, 'asof': str(state['asof']), 'entries': entries,
+            'total': str(known) if complete else None, 'known_total': str(known), 'complete': complete}
+
+
+def hourly_income(connection, chat_id, state, markets, observed_at):
+    hour = observed_at[:13]
+    fingerprint = ledger_fingerprint(state)
+    cached = connection.execute('SELECT hour,ledger,data FROM investment_income_hourly WHERE chat_id=?', (chat_id,)).fetchone()
+    if cached and cached[0] == hour and cached[1] == fingerprint:
+        return json.loads(cached[2])
+    data = coupon_income_per_day(state, markets, observed_at)
+    connection.execute('''INSERT INTO investment_income_hourly VALUES (?,?,?,?) ON CONFLICT(chat_id)
+        DO UPDATE SET hour=excluded.hour,ledger=excluded.ledger,data=excluded.data''',
+        (chat_id, hour, fingerprint, json.dumps(data, ensure_ascii=False)))
+    return data
+
+
+def daily_income_text(data, argument=''):
+    entries = data['entries']
+    if argument:
+        entries = [e for e in entries if argument.casefold() in e['name'].casefold() or argument.upper() == e['isin']]
+        if not entries:
+            return 'Не нашёл выпуск. Список: /daily_income'
+    total = sum((dec(e['per_day']) for e in entries), Decimal(0)) if all(e['per_day'] is not None for e in entries) else None
+    lines = [f"Купонный доход: {rub(total)} / день", '']
+    for e in entries:
+        if e['per_day'] is None:
+            lines.append(f"• {e['name']}: нет данных — {e['reason']}")
+        else:
+            lines.append(f"• {e['name']}: ≈{rub(e['per_bond'])}/шт. × {dec(e['quantity']):g} = ≈{rub(e['per_day'])}/день")
+        if argument and e.get('coupon'):
+            lines.append(f"Купон {rub(e['coupon'])} / {e['days']} дней. Первая покупка: {day(e['first_purchase']):%d.%m.%Y}." if e['first_purchase'] else f"Купон {rub(e['coupon'])} / {e['days']} дней.")
+            lines.append(f"Уплачено НКД при покупках: {rub(e['paid_nkd'])} — не твой заработок.")
+    if total is None:
+        lines.append('По известным выпускам: ' + rub(sum((dec(e['per_day']) for e in entries if e['per_day'] is not None), Decimal(0))) + '/день; это не весь портфель.')
+    at = datetime.fromisoformat(data['observed_at'])
+    lines.extend(['', f"Расчёт полного дня, до комиссий и налогов. Обновлено {at:%d.%m %H:%M}; количество бумаг по отчёту на {day(data['asof']):%d.%m}.",
+                  'Деньги поступают в даты купонов, а не каждый день.'])
+    return '\n'.join(lines)
+
+
 def daily_change_text(current, previous):
     def money(value):
         return rub(value).replace('.00 ₽', ' ₽')
@@ -767,6 +847,14 @@ def daily_change_text(current, previous):
         return dec(current[key]) - dec(previous[key]) if comparable and key in previous and key in current else Decimal(0)
     price_change = change('price')
     nkd_change = change('nkd')
+    income = current.get('daily_income')
+    if income is not None:
+        rate = income['total']
+        return '\n'.join([lines[0],
+            f"Цена бумаг: {money(previous['price']) if comparable else '—'} → {money(current['price'])}",
+            f"Цена: {signed(price_change) if comparable else 'нет данных'} · НКД/день: {signed(rate) if rate is not None else 'нет данных'}",
+            'По каждой бумаге: /daily_income',
+            f"Итого за день (расчёт): {signed(price_change + dec(rate)) if comparable and rate is not None else 'нет полного расчёта'}"])
     if comparable:
         lines.append(f"Цена: {signed(price_change)} · НКД: {signed(nkd_change)}")
     else:
@@ -906,8 +994,12 @@ def report_text(connection, chat_id, command, argument, today, market, detailed=
             return "Выбери выпуск:", {"inline_keyboard": [[{"text": bonds[i]["name"], "callback_data": "investbond:" + i}] for i in matches]}
         bonds = {matches[0]: bonds[matches[0]]}
     markets = market.all(list(state["bonds"]))
+    timestamp = observed_at or today.isoformat() + 'T10:00:00'
+    if command == '/daily_income':
+        return daily_income_text(hourly_income(connection, chat_id, state, markets, timestamp), argument), MENU
     if command == '/portfolio_day':
         current = daily_snapshot(state, markets, observed_at or today.isoformat() + 'T10:00:00')
+        current['daily_income'] = hourly_income(connection, chat_id, state, markets, timestamp)
         previous = yesterday_valuation(state, markets, market, today)
         if previous is None:
             connection.execute('INSERT OR IGNORE INTO investment_daily_snapshots VALUES (?,?,?)',

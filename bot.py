@@ -1783,7 +1783,7 @@ def investment_worker(chat_id, command, argument, today, detailed, preview_key=N
     print("Investment calculation started:", command, flush=True)
     try:
         observed_at = None
-        if command == '/portfolio_day':
+        if command in ('/portfolio_day', '/daily_income'):
             user = get_user(chat_id)
             observed_at = datetime.now(ZoneInfo(user['timezone'] if user else DEFAULT_TIMEZONE)).isoformat(timespec='seconds')
         with db() as connection:
@@ -2035,6 +2035,7 @@ def help_text():
         "/zero — сегодня без трат\n"
         "/pnl — общий результат по облигациям сейчас\n"
         "/portfolio_day — изменение портфеля, рыночная цена и НКД\n"
+        "/daily_income — сколько купоны приносят в день по каждой бумаге\n"
         "/invest — облигации, прибыль, прогноз и импорт брокерского XLSX\n"
         "/help — эта подсказка"
     )
@@ -2930,6 +2931,49 @@ def send_daily_profit(user, day):
 
 INVESTMENT_DAILY_PENDING = set()
 INVESTMENT_HISTORY_PENDING = set()
+INVESTMENT_INCOME_PENDING = set()
+
+
+def investment_income_worker(chat_id, observed_at):
+    try:
+        with db() as connection:
+            state = investments.portfolio(connection, chat_id)
+        if state:
+            markets = investments.Market(db).all(list(state['bonds']))
+            with db() as connection:
+                latest = investments.portfolio(connection, chat_id)
+                if latest and investments.ledger_fingerprint(latest) == investments.ledger_fingerprint(state):
+                    data = investments.hourly_income(connection, chat_id, state, markets, observed_at)
+                    print('Hourly coupon income updated:', data['complete'], flush=True)
+    except Exception as error:
+        print('Hourly coupon income failed:', type(error).__name__, flush=True)
+    finally:
+        with INVESTMENT_LOCK:
+            INVESTMENT_INCOME_PENDING.discard(chat_id)
+
+
+def schedule_investment_income(user, local_now):
+    chat_id = user['chat_id']
+    if chat_id not in ALLOWED_USER_IDS:
+        return
+    timestamp = local_now.isoformat(timespec='seconds')
+    with db() as connection:
+        state = investments.portfolio(connection, chat_id)
+        if not state:
+            return
+        cached = connection.execute('SELECT hour,ledger FROM investment_income_hourly WHERE chat_id=?', (chat_id,)).fetchone()
+        if cached and cached[0] == timestamp[:13] and cached[1] == investments.ledger_fingerprint(state):
+            return
+    with INVESTMENT_LOCK:
+        if chat_id in INVESTMENT_INCOME_PENDING:
+            return
+        INVESTMENT_INCOME_PENDING.add(chat_id)
+    try:
+        INVESTMENT_WORKERS.submit(investment_income_worker, chat_id, timestamp)
+    except Exception:
+        with INVESTMENT_LOCK:
+            INVESTMENT_INCOME_PENDING.discard(chat_id)
+        raise
 
 
 def portfolio_history_worker(chat_id, month_start, today, request_key=None):
@@ -3023,6 +3067,7 @@ def investment_daily_worker(chat_id, today, observed_at, notify=True):
         snapshot = investments.daily_snapshot(state, markets, observed_at)
         previous = investments.yesterday_valuation(state, markets, market, today) if notify else None
         with db() as connection:
+            snapshot['daily_income'] = investments.hourly_income(connection, chat_id, state, markets, observed_at)
             connection.execute('INSERT INTO investment_daily_snapshots VALUES (?,?,?) ON CONFLICT(chat_id,day) DO UPDATE SET data=excluded.data',
                                (chat_id, today.isoformat(), json.dumps(snapshot, ensure_ascii=False)))
         print('Investment daily snapshot saved:', today.isoformat(), flush=True)
@@ -3072,6 +3117,7 @@ def run_schedule():
         today = local_now.date()
         expense_today = business_day(local_now, user["day_cutoff_hour"])
         hour, minute = local_now.hour, local_now.minute
+        schedule_investment_income(user, local_now)
         schedule_investment_daily(user, local_now)
         process_recurring(user, expense_today)
         if hour == max(user["morning_hour"], user["day_cutoff_hour"]) and minute < 5:
@@ -3110,6 +3156,9 @@ def dispatch_portfolio_preview():
     if chat_id not in ALLOWED_USER_IDS:
         return
     key = 'portfolio_preview:' + request
+    command = os.environ.get('PORTFOLIO_PREVIEW_COMMAND', '/portfolio_day')
+    if command not in ('/portfolio_day', '/daily_income'):
+        return
     with db() as connection:
         if connection.execute('SELECT 1 FROM sent_messages WHERE chat_id=? AND message_type=? LIMIT 1', (chat_id, key)).fetchone():
             return
@@ -3123,7 +3172,7 @@ def dispatch_portfolio_preview():
             return
         INVESTMENT_PENDING.add(chat_id)
     try:
-        INVESTMENT_WORKERS.submit(investment_worker, chat_id, '/portfolio_day', '', user_calendar_today(user), False, key)
+        INVESTMENT_WORKERS.submit(investment_worker, chat_id, command, '', user_calendar_today(user), False, key)
     except Exception:
         with INVESTMENT_LOCK:
             INVESTMENT_PENDING.discard(chat_id)
