@@ -7,7 +7,7 @@ RUN apt-get update \
 WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
-COPY bot.py investments.py /app/
+COPY bot.py investments.py spending_insights.py /app/
 RUN mkdir -p /data
 
 ENV PYTHONUNBUFFERED=1 \

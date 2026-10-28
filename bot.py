@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A small Telegram expense tracker with an optional bond portfolio, no AI."""
+"""Telegram expense tracker, bond portfolio and optional AI-selected expense facts."""
 
 import calendar
 import csv
@@ -22,6 +22,7 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
 
 import investments
+import spending_insights
 
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -85,6 +86,7 @@ def db():
 def init_db():
     with db() as connection:
         investments.init_db(connection)
+        spending_insights.init_db(connection)
         if investments.bootstrap(connection, os.environ.get("INVESTMENT_BOOTSTRAP_GZIP_BASE64", ""), ALLOWED_USER_IDS):
             print("Initial investment report imported; expense ledger unchanged")
         connection.executescript(
@@ -2006,6 +2008,8 @@ def help_text():
         "Команды:\n"
         "/budget 70000 — бюджет на месяц\n"
         "/status — расходы и остаток бюджета на сегодня\n"
+        "/summary — интересные факты за день, неделю и месяц\n"
+        "/summary day|week|month — факт за выбранный период\n"
         "/salary 100000 — зарплата за месяц (0 — убрать)\n"
         "/income подработка 5000 — другой доход; /incomes — список\n"
         "/refund 123 800 — возврат покупки #123 (номер в /history)\n"
@@ -2060,6 +2064,20 @@ def handle_message(message):
     text = (message.get("text") or message.get("caption") or "").strip()
     ensure_user(chat_id)
     user = get_user(chat_id)
+
+    summary_parts = text.casefold().split()
+    if summary_parts and summary_parts[0] in ("/summary", "/сводка", "сводка") and (
+        summary_parts[0] != "сводка" or len(summary_parts) == 1
+    ):
+        if message["chat"].get("type", "private") != "private":
+            return
+        names = {"day": "day", "день": "day", "week": "week", "неделя": "week", "month": "month", "месяц": "month"}
+        if len(summary_parts) > 2 or (len(summary_parts) == 2 and summary_parts[1] not in names):
+            send(chat_id, "Напиши /summary или /summary day, /summary week, /summary month.")
+            return
+        periods = [names[summary_parts[1]]] if len(summary_parts) == 2 else ["day", "week", "month"]
+        queue_expense_insights(user, user_today(user), periods)
+        return
 
     if message.get("document"):
         if text == "/invest_import" or (text == "/import" and message["document"].get("file_name", "").lower().endswith(".xlsx")):
@@ -3109,6 +3127,85 @@ def schedule_investment_daily(user, local_now):
         raise
 
 
+INSIGHT_WORKERS = ThreadPoolExecutor(max_workers=2, thread_name_prefix="expense-insight")
+INSIGHT_LOCK = threading.Lock()
+INSIGHT_PENDING = set()
+INSIGHT_RETRY_AFTER = {}
+
+
+def expense_insights_worker(chat_id, today, periods, completed):
+    try:
+        sections = []
+        for period in periods:
+            try:
+                section = spending_insights.fact(db, chat_id, period, spending_insights.window(period, today, completed))
+            except spending_insights.InsightError as error:
+                print("Expense insight unavailable:", str(error), flush=True)
+                with INSIGHT_LOCK:
+                    INSIGHT_RETRY_AFTER[chat_id] = time.monotonic() + 300
+                if not completed:
+                    sections.append(f"{spending_insights.LABELS[period]}: не удалось получить факт. Попробуй через несколько минут; обычные отчёты доступны через /report.")
+                continue
+            if completed:
+                # Each successful delivery is marked independently; failed sends can retry.
+                if send(chat_id, section) is not None:
+                    mark_sent(chat_id, today, "expense_ai_" + period)
+            else:
+                sections.append(section)
+        if sections:
+            send(chat_id, "\n\n".join(sections))
+    except Exception as error:
+        print("Expense insight failed:", type(error).__name__, flush=True)
+        with INSIGHT_LOCK:
+            INSIGHT_RETRY_AFTER[chat_id] = time.monotonic() + 300
+        if not completed:
+            send(chat_id, "Не удалось собрать сводку. Траты не изменены; обычный отчёт: /report.")
+    finally:
+        with INSIGHT_LOCK:
+            INSIGHT_PENDING.discard(chat_id)
+
+
+def queue_expense_insights(user, today, periods, completed=False):
+    chat_id = user["chat_id"]
+    if chat_id not in ALLOWED_USER_IDS:
+        return
+    if not os.environ.get("RIVER_API_KEY", "").strip():
+        if not completed:
+            send(chat_id, "ИИ-сводка пока не подключена. Обычный отчёт: /report.")
+        return
+    with INSIGHT_LOCK:
+        busy = chat_id in INSIGHT_PENDING
+        cooldown = INSIGHT_RETRY_AFTER.get(chat_id, 0) > time.monotonic()
+        if not busy and not cooldown:
+            INSIGHT_PENDING.add(chat_id)
+    if busy or cooldown:
+        if not completed:
+            send(chat_id, "Сводка уже готовится." if busy else "Сервис фактов временно недоступен. Попробуй через 5 минут; отчёт: /report.")
+        return
+    if not completed:
+        send(chat_id, "Смотрю твои траты…")
+    try:
+        INSIGHT_WORKERS.submit(expense_insights_worker, chat_id, today, periods, completed)
+    except Exception:
+        with INSIGHT_LOCK:
+            INSIGHT_PENDING.discard(chat_id)
+        raise
+
+
+def schedule_expense_insights(user, local_now):
+    if local_now.hour != 10 or local_now.minute >= 5:
+        return
+    today = local_now.date()
+    periods = ["day"]
+    if today.weekday() == 0:
+        periods.append("week")
+    if today.day == 1:
+        periods.append("month")
+    periods = [period for period in periods if not was_sent(user["chat_id"], today, "expense_ai_" + period)]
+    if periods:
+        queue_expense_insights(user, today, periods, completed=True)
+
+
 def run_schedule():
     with db() as connection:
         users = connection.execute("SELECT * FROM users").fetchall()
@@ -3117,6 +3214,7 @@ def run_schedule():
         today = local_now.date()
         expense_today = business_day(local_now, user["day_cutoff_hour"])
         hour, minute = local_now.hour, local_now.minute
+        schedule_expense_insights(user, local_now)
         schedule_investment_income(user, local_now)
         schedule_investment_daily(user, local_now)
         process_recurring(user, expense_today)
