@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Telegram expense tracker, bond portfolio and optional AI-selected expense facts."""
+"""Telegram expense tracker, bond portfolio and optional AI expense analysis."""
 
 import calendar
 import csv
@@ -3138,7 +3138,7 @@ def expense_insights_worker(chat_id, today, periods, completed):
         sections = []
         for period in periods:
             try:
-                section = spending_insights.fact(db, chat_id, period, spending_insights.window(period, today, completed))
+                section = spending_insights.fact(db, chat_id, period, spending_insights.window(period, today, completed), completed=completed)
             except spending_insights.InsightError as error:
                 print("Expense insight unavailable:", str(error), flush=True)
                 with INSIGHT_LOCK:
