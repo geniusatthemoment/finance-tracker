@@ -22,7 +22,7 @@ class CreatineTest(unittest.TestCase):
         bot.ensure_user(2)
 
         class FrozenDateTime(datetime):
-            current = datetime(2026, 11, 2, 2, 30, tzinfo=ZoneInfo("Asia/Tomsk"))
+            current = datetime(2026, 11, 2, 14, 30, tzinfo=ZoneInfo("Asia/Tomsk"))
 
             @classmethod
             def now(cls, tz=None):
@@ -38,7 +38,7 @@ class CreatineTest(unittest.TestCase):
             bot.handle_message({"from": {"id": user}, "chat": {"id": user, "type": chat_type}, "text": text})
         return sender
 
-    def test_additive_grams_calendar_day_and_expenses_unchanged(self):
+    def test_additive_grams_and_expenses_unchanged(self):
         today = date(2026, 11, 2)
         bot.save_expenses(1, [("Еда", "", 50000)], today)
         self.message("КРЕАТИН 5")
@@ -84,7 +84,40 @@ class CreatineTest(unittest.TestCase):
         reminders = [call for call in sender.call_args_list if call.args[1].startswith("Напоминание про креатин")]
         self.assertEqual(len(reminders), 6)
         self.assertEqual([call.args[0] for call in reminders], [1, 2, 1, 2, 1, 2])
-        self.assertIn("За 03.11", reminders[-1].args[1])
+        self.assertIn("За 02.11", reminders[-1].args[1])
+
+    def test_night_intake_query_and_report_use_previous_day_until_four(self):
+        self.clock.current = datetime(2026, 11, 2, 3, 59, tzinfo=ZoneInfo("Asia/Tomsk"))
+        self.assertIn("за 01.11.2026: 5 г", self.message("креатин 5").call_args.args[1])
+        self.assertIn("Креатин · 01.11.2026", self.message("/creatine").call_args.args[1])
+        report = self.message("/creatine_report").call_args.args[1]
+        self.assertIn("01.11–01.11", report)
+        self.assertIn("В среднем в день: 5 г", report)
+        self.assertNotIn("02.11 —", report)
+        self.clock.current = self.clock.current.replace(hour=4, minute=0)
+        self.assertIn("Записано: 0 г", self.message("/creatine").call_args.args[1])
+        self.message("креатин 10")
+        self.assertEqual(bot.creatine_total(1, date(2026, 11, 2)), 10000)
+
+    def test_explicit_calendar_date_at_night_is_preserved(self):
+        self.clock.current = datetime(2026, 11, 2, 2, tzinfo=ZoneInfo("Asia/Tomsk"))
+        self.message("креатин 5 02.11.2026")
+        self.assertEqual(bot.creatine_total(1, date(2026, 11, 2)), 5000)
+        self.assertEqual(bot.creatine_total(1, date(2026, 11, 1)), 0)
+
+    def test_report_month_boundary_before_four_and_custom_cutoff(self):
+        self.clock.current = datetime(2026, 11, 1, 3, tzinfo=ZoneInfo("Asia/Tomsk"))
+        self.message("креатин 5")
+        report = self.message("/creatine_report").call_args.args[1]
+        self.assertIn("10.2026 (01.10–31.10)", report)
+        self.assertIn("31.10 — 5 г", report)
+        self.assertIn("ещё не начался", self.message("/creatine_report 11.2026").call_args.args[1])
+        self.clock.current = self.clock.current.replace(hour=4)
+        self.assertIn("11.2026 (01.11–01.11)", self.message("/creatine_report").call_args.args[1])
+        with bot.db() as connection:
+            connection.execute("UPDATE users SET day_cutoff_hour=6 WHERE chat_id=1")
+        self.message("креатин 2")
+        self.assertEqual(bot.creatine_total(1, date(2026, 10, 31)), 7000)
 
     def test_reminder_retries_failed_delivery_and_ignores_expense_ack(self):
         user = bot.get_user(1)

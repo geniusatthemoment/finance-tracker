@@ -666,9 +666,11 @@ def creatine_total(chat_id, day):
 
 
 def creatine_report_text(user, month_start):
-    today = user_calendar_today(user)
+    today = user_today(user)
     month_end = month_start.replace(day=calendar.monthrange(month_start.year, month_start.month)[1])
     end = min(today, month_end)
+    if end < month_start:
+        return f"Креатин · {month_start:%m.%Y}\nУчётный месяц ещё не начался. День меняется в {user['day_cutoff_hour']:02d}:00."
     days = (end - month_start).days + 1
     with db() as connection:
         totals = dict(connection.execute(
@@ -691,7 +693,7 @@ def creatine_report_text(user, month_start):
 
 
 def handle_creatine(message, user, text):
-    """Reserve creatine messages before the expense parser; calendar days apply."""
+    """Reserve creatine messages before the expense parser; use the expense day cutoff."""
     prefix = DATE_PREFIX_RE.match(text)
     body = prefix.group(2) if prefix else text
     parts = body.split(maxsplit=1)
@@ -700,7 +702,7 @@ def handle_creatine(message, user, text):
     chat_id = user["chat_id"]
     if message["chat"].get("type", "private") != "private" or chat_id != message["from"]["id"]:
         return True
-    today = user_calendar_today(user)
+    today = user_today(user)
     day = today
     amount = parts[1].strip() if len(parts) == 2 else ""
     try:
@@ -709,7 +711,7 @@ def handle_creatine(message, user, text):
         if not date_text and suffix:
             amount, date_text = suffix.group(1).strip(), suffix.group(2)
         if date_text:
-            day = parse_date(date_text, today)
+            day = parse_date(date_text, today, user_calendar_today(user))
         if not amount:
             send(chat_id, f"Креатин · {day:%d.%m.%Y}\nЗаписано: {grams_text(creatine_total(chat_id, day))} г\nДобавить: креатин 5")
             return True
@@ -2166,8 +2168,8 @@ def handle_message(message):
         try:
             if len(report_parts) > 2:
                 raise ValueError("Формат: /creatine_report или /creatine_report 11.2026")
-            today = user_calendar_today(user)
-            month = parse_report_month(report_parts[1], today) if len(report_parts) == 2 else today.replace(day=1)
+            today = user_today(user)
+            month = parse_report_month(report_parts[1], user_calendar_today(user)) if len(report_parts) == 2 else today.replace(day=1)
             send(chat_id, creatine_report_text(user, month))
         except ValueError as error:
             send(chat_id, str(error).replace("/report 10.2026", "/creatine_report 11.2026"))
@@ -3321,7 +3323,7 @@ def schedule_creatine(user, local_now):
     chat_id = user["chat_id"]
     if chat_id not in ALLOWED_USER_IDS or local_now.hour not in (14, 20, 0) or local_now.minute >= 5:
         return
-    day = local_now.date()
+    day = business_day(local_now, user["day_cutoff_hour"])
     key = f"creatine_reminder_{local_now.hour:02d}"
     if was_sent(chat_id, day, key):
         return
