@@ -665,6 +665,31 @@ def creatine_total(chat_id, day):
         ).fetchone()[0]
 
 
+def creatine_report_text(user, month_start):
+    today = user_calendar_today(user)
+    month_end = month_start.replace(day=calendar.monthrange(month_start.year, month_start.month)[1])
+    end = min(today, month_end)
+    days = (end - month_start).days + 1
+    with db() as connection:
+        totals = dict(connection.execute(
+            "SELECT taken_on,SUM(amount_mg) FROM supplement_intakes "
+            "WHERE chat_id=? AND supplement='creatine' AND taken_on BETWEEN ? AND ? GROUP BY taken_on",
+            (user["chat_id"], month_start.isoformat(), end.isoformat()),
+        ).fetchall())
+    total = sum(totals.values())
+    average = (Decimal(total) / 1000 / days).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    average_text = format(average, "f").rstrip("0").rstrip(".")
+    lines = [f"Креатин · {month_start:%m.%Y} ({month_start:%d.%m}–{end:%d.%m})",
+             f"Всего записано: {grams_text(total)} г",
+             f"Дней с записями: {len(totals)} из {days}",
+             f"В среднем в день: {average_text} г", "", "По дням:"]
+    for offset in range(days):
+        day = month_start + timedelta(days=offset)
+        lines.append(f"• {day:%d.%m} — {grams_text(totals.get(day.isoformat(), 0))} г")
+    lines.append("\n0 г — нет записей за день.")
+    return "\n".join(lines)
+
+
 def handle_creatine(message, user, text):
     """Reserve creatine messages before the expense parser; calendar days apply."""
     prefix = DATE_PREFIX_RE.match(text)
@@ -2072,6 +2097,8 @@ def help_text():
         "Категория может быть любой. Сумму пиши без пробелов, дробную — через точку.\n\n"
         "Команды:\n"
         "/creatine — креатин за сегодня; /creatine 5 — добавить 5 г\n"
+        "/creatine_report — отчёт по креатину за месяц\n"
+        "/creatine_report 11.2026 — конкретный месяц\n"
         "креатин 5 01.11.2026 — записать на другую дату\n"
         "/budget 70000 — бюджет на месяц\n"
         "/status — расходы и остаток бюджета на сегодня\n"
@@ -2131,6 +2158,20 @@ def handle_message(message):
     text = (message.get("text") or message.get("caption") or "").strip()
     ensure_user(chat_id)
     user = get_user(chat_id)
+
+    report_parts = text.casefold().split()
+    if report_parts and report_parts[0] == "/creatine_report":
+        if message["chat"].get("type", "private") != "private" or chat_id != message["from"]["id"]:
+            return
+        try:
+            if len(report_parts) > 2:
+                raise ValueError("Формат: /creatine_report или /creatine_report 11.2026")
+            today = user_calendar_today(user)
+            month = parse_report_month(report_parts[1], today) if len(report_parts) == 2 else today.replace(day=1)
+            send(chat_id, creatine_report_text(user, month))
+        except ValueError as error:
+            send(chat_id, str(error).replace("/report 10.2026", "/creatine_report 11.2026"))
+        return
 
     if handle_creatine(message, user, text):
         return

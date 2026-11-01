@@ -105,6 +105,43 @@ class CreatineTest(unittest.TestCase):
             bot.schedule_creatine(bot.get_user(-100), datetime(2026, 11, 2, 14))
         sender.assert_not_called()
 
+    def test_current_month_report_includes_today_zeros_and_all_days_average(self):
+        self.message("креатин 5")
+        self.message("креатин 2.5")
+        self.message("креатин 10", 2)
+        response = self.message("/creatine_report").call_args.args[1]
+        self.assertIn("11.2026 (01.11–02.11)", response)
+        self.assertIn("Всего записано: 7.5 г", response)
+        self.assertIn("Дней с записями: 1 из 2", response)
+        self.assertIn("В среднем в день: 3.75 г", response)
+        self.assertIn("01.11 — 0 г", response)
+        self.assertIn("02.11 — 7.5 г", response)
+        self.assertNotIn("03.11 —", response)
+        self.assertIn("Всего записано: 10 г", self.message("/creatine_report", 2).call_args.args[1])
+
+    def test_past_month_complete_and_leap_year(self):
+        self.message("креатин 5 01.10.2026")
+        response = self.message("/creatine_report 10.2026").call_args.args[1]
+        self.assertIn("01.10–31.10", response)
+        self.assertIn("Всего записано: 5 г", response)
+        self.assertIn("В среднем в день: 0.16 г", response)
+        self.assertIn("31.10 — 0 г", response)
+        response = self.message("/creatine_report 02.2024").call_args.args[1]
+        self.assertIn("29.02 — 0 г", response)
+        self.assertIn("В среднем в день: 0 г", response)
+        self.assertEqual(response.count("•"), 29)
+
+    def test_report_rejects_invalid_future_month_and_preserves_storage(self):
+        self.message("креатин 5")
+        for argument in ("13.2026", "12.2026", "11.0000", "ноябрь", "11.2026 extra"):
+            response = self.message("/creatine_report " + argument).call_args.args[1]
+            self.assertNotIn("По дням:", response)
+        self.message("/creatine_report", 99).assert_not_called()
+        self.message("/creatine_report", 1, "group").assert_not_called()
+        with bot.db() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM supplement_intakes").fetchone()[0], 1)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM expenses").fetchone()[0], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
