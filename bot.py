@@ -114,6 +114,17 @@ def init_db():
             CREATE INDEX IF NOT EXISTS expenses_chat_date
                 ON expenses(chat_id, spent_on);
 
+            CREATE TABLE IF NOT EXISTS supplement_intakes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                supplement TEXT NOT NULL,
+                amount_mg INTEGER NOT NULL CHECK(amount_mg > 0),
+                taken_on TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS supplement_intakes_chat_date
+                ON supplement_intakes(chat_id, supplement, taken_on);
+
             CREATE TABLE IF NOT EXISTS day_status (
                 chat_id INTEGER NOT NULL,
                 day TEXT NOT NULL,
@@ -639,6 +650,60 @@ def user_today(user):
 
 def user_calendar_today(user):
     return datetime.now(ZoneInfo(user["timezone"])).date()
+
+
+def grams_text(amount_mg):
+    return format(Decimal(amount_mg) / 1000, "f").rstrip("0").rstrip(".") if amount_mg % 1000 else str(amount_mg // 1000)
+
+
+def creatine_total(chat_id, day):
+    with db() as connection:
+        return connection.execute(
+            "SELECT COALESCE(SUM(amount_mg), 0) FROM supplement_intakes "
+            "WHERE chat_id=? AND supplement='creatine' AND taken_on=?",
+            (chat_id, day.isoformat()),
+        ).fetchone()[0]
+
+
+def handle_creatine(message, user, text):
+    """Reserve creatine messages before the expense parser; calendar days apply."""
+    prefix = DATE_PREFIX_RE.match(text)
+    body = prefix.group(2) if prefix else text
+    parts = body.split(maxsplit=1)
+    if not parts or parts[0].casefold() not in ("креатин", "/creatine", "/креатин"):
+        return False
+    chat_id = user["chat_id"]
+    if message["chat"].get("type", "private") != "private" or chat_id != message["from"]["id"]:
+        return True
+    today = user_calendar_today(user)
+    day = today
+    amount = parts[1].strip() if len(parts) == 2 else ""
+    try:
+        date_text = prefix.group(1) if prefix else None
+        suffix = DATE_SUFFIX_RE.match(amount)
+        if not date_text and suffix:
+            amount, date_text = suffix.group(1).strip(), suffix.group(2)
+        if date_text:
+            day = parse_date(date_text, today)
+        if not amount:
+            send(chat_id, f"Креатин · {day:%d.%m.%Y}\nЗаписано: {grams_text(creatine_total(chat_id, day))} г\nДобавить: креатин 5")
+            return True
+        match = re.fullmatch(r"(\d{1,6}(?:[.,]\d{1,3})?)\s*(?:г|гр\.?|грамм(?:а|ов)?)?", amount, re.I)
+        if not match:
+            raise ValueError("Напиши: креатин 5 или креатин 5 01.11.2026")
+        amount_mg = int(Decimal(match[1].replace(",", ".")) * 1000)
+        if amount_mg <= 0:
+            raise ValueError("Количество должно быть больше нуля")
+        with db() as connection:
+            connection.execute(
+                "INSERT INTO supplement_intakes(chat_id,supplement,amount_mg,taken_on,created_at) VALUES (?,'creatine',?,?,?)",
+                (chat_id, amount_mg, day.isoformat(), datetime.utcnow().isoformat()),
+            )
+        total = creatine_total(chat_id, day)
+        send(chat_id, f"Креатин: +{grams_text(amount_mg)} г\nВсего за {day:%d.%m.%Y}: {grams_text(total)} г")
+    except ValueError as error:
+        send(chat_id, str(error).replace("записать трату", "записать приём"))
+    return True
 
 
 def get_user(chat_id):
@@ -2006,6 +2071,8 @@ def help_text():
         "зал 2500 ЕЖЕМЕСЯЧНО\n\n"
         "Категория может быть любой. Сумму пиши без пробелов, дробную — через точку.\n\n"
         "Команды:\n"
+        "/creatine — креатин за сегодня; /creatine 5 — добавить 5 г\n"
+        "креатин 5 01.11.2026 — записать на другую дату\n"
         "/budget 70000 — бюджет на месяц\n"
         "/status — расходы и остаток бюджета на сегодня\n"
         "/summary — интересные факты за день, неделю и месяц\n"
@@ -2064,6 +2131,9 @@ def handle_message(message):
     text = (message.get("text") or message.get("caption") or "").strip()
     ensure_user(chat_id)
     user = get_user(chat_id)
+
+    if handle_creatine(message, user, text):
+        return
 
     summary_parts = text.casefold().split()
     if summary_parts and summary_parts[0] in ("/summary", "/сводка", "сводка") and (
@@ -3206,6 +3276,20 @@ def schedule_expense_insights(user, local_now):
         queue_expense_insights(user, today, periods, completed=True)
 
 
+def schedule_creatine(user, local_now):
+    chat_id = user["chat_id"]
+    if chat_id not in ALLOWED_USER_IDS or local_now.hour not in (14, 20, 0) or local_now.minute >= 5:
+        return
+    day = local_now.date()
+    key = f"creatine_reminder_{local_now.hour:02d}"
+    if was_sent(chat_id, day, key):
+        return
+    total = creatine_total(chat_id, day)
+    text = f"Напоминание про креатин 💪\nЗа {day:%d.%m}: записано {grams_text(total)} г.\nЕсли принял, запиши: креатин 5"
+    if send(chat_id, text) is not None:
+        mark_sent(chat_id, day, key)
+
+
 def run_schedule():
     with db() as connection:
         users = connection.execute("SELECT * FROM users").fetchall()
@@ -3214,6 +3298,7 @@ def run_schedule():
         today = local_now.date()
         expense_today = business_day(local_now, user["day_cutoff_hour"])
         hour, minute = local_now.hour, local_now.minute
+        schedule_creatine(user, local_now)
         schedule_expense_insights(user, local_now)
         schedule_investment_income(user, local_now)
         schedule_investment_daily(user, local_now)
