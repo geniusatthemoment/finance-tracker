@@ -19,6 +19,7 @@ from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from zoneinfo import ZoneInfo
 
 
 ISS = "https://iss.moex.com/iss"
@@ -191,19 +192,20 @@ def parse_alfa(content):
         }
         if dec(bonds[isin]["opening"]) < 0 or dec(bonds[isin]["quantity"]) < 0:
             raise ValueError("Короткие позиции по облигациям пока не поддерживаются.")
-    trades = []
-    trade_rows = sheets["Завершенные сделки"]
-    h = next((r for r in trade_rows if any(clean(v) == "№ сделки" for v in r)), None)
-    if h is None:
-        raise ValueError("Не найден заголовок сделок.")
-    def col(prefix):
-        return next((i for i, v in enumerate(h) if clean(v).startswith(prefix)), None)
-    columns = {k: col(v) for k, v in {
+    trade_labels = {
         "id": "№ сделки", "date": "Дата заключен", "settled": "Дата расчетов",
         "isin": "ISIN", "qty": "Количество актива", "amount": "Сумма сделки",
         "nkd": "В т.ч. НКД", "fee": "Комиссия банка", "currency": "Валюта расчетов",
         "comment": "Коммент.", "name": "Актив",
-    }.items()}
+    }
+    def trade_columns(rows):
+        header = next((r for r in rows if any(clean(v) == "№ сделки" for v in r)), ())
+        return {key: next((i for i, v in enumerate(header) if clean(v).startswith(label)), None)
+                for key, label in trade_labels.items()}
+
+    trades = []
+    trade_rows = sheets["Завершенные сделки"]
+    columns = trade_columns(trade_rows)
     if any(columns[k] is None for k in ("id", "date", "settled", "isin", "qty", "amount", "nkd", "fee", "currency")):
         raise ValueError("Неизвестный формат колонок сделок.")
     for row in trade_rows:
@@ -229,6 +231,19 @@ def parse_alfa(content):
         })
     if not bonds:
         raise ValueError("В отчёте не найдено облигаций.")
+    pending = []
+    pending_rows = sheets.get("Незавершенные сделки", [])
+    columns = trade_columns(pending_rows)
+    if all(columns[key] is not None for key in ("isin", "qty", "settled")):
+        for row in pending_rows:
+            isin = clean(row[columns["isin"]])
+            comment = clean(row[columns["comment"]]) if columns["comment"] is not None else ""
+            if isin not in bonds or "репо" in comment.casefold():
+                continue
+            settled = day(row[columns["settled"]])
+            if settled > period[1]:
+                pending.append({"isin": isin, "settled": settled.isoformat(),
+                                "quantity": str(dec(row[columns["qty"]]))})
     cash = []
     cash_rows = sheets["Движение ДС"]
     h = next((r for r in cash_rows if "Наименование операции" in [clean(v) for v in r]), None)
@@ -270,8 +285,11 @@ def parse_alfa(content):
                for isin, bond in bonds.items()):
             warnings.append("Есть неторговые операции с облигациями: себестоимость требует проверки.")
             break
-    return {"account": account, "start": period[0].isoformat(), "end": period[1].isoformat(),
-            "bonds": bonds, "trades": trades, "cash": cash, "warnings": warnings}
+    report = {"account": account, "start": period[0].isoformat(), "end": period[1].isoformat(),
+              "bonds": bonds, "trades": trades, "cash": cash, "warnings": warnings}
+    if pending:
+        report["pending_trades"] = pending
+    return report
 
 
 def import_report(connection, chat_id, content):
@@ -324,6 +342,7 @@ def portfolio(connection, chat_id):
         return None
     latest = max(reports, key=lambda r: (r["end"], -date.fromisoformat(r["start"]).toordinal()))
     result = {"asof": date.fromisoformat(latest["end"]), "start": reports[0]["start"], "bonds": {}, "cash": {}, "warnings": []}
+    result["pending_trades"] = latest.get("pending_trades", [])
     frontier = reports[0]["end"]
     for report in reports:
         if date.fromisoformat(report["start"]) > date.fromisoformat(frontier) + timedelta(days=1):
@@ -518,15 +537,19 @@ def payment_value(row):
     return dec(value) if value is not None else None
 
 
+def coupon_period(coupons, at):
+    periods = [r for r in coupons if r.get("startdate") and r.get("coupondate")
+               and day(r["startdate"]) <= at < day(r["coupondate"])]
+    return periods[0] if len(periods) == 1 else None
+
+
 def accrual(coupons, at):
-    for row in coupons:
-        if not row.get("startdate") or not row.get("coupondate"):
-            continue
-        start, end = day(row["startdate"]), day(row["coupondate"])
-        if start <= at < end:
-            value = payment_value(row)
-            return value * Decimal((at - start).days) / Decimal((end - start).days) if value is not None and end > start else None
-    return None
+    row = coupon_period(coupons, at)
+    value = payment_value(row) if row else None
+    if value is None:
+        return None
+    start, end = day(row["startdate"]), day(row["coupondate"])
+    return value * Decimal((at - start).days) / (end - start).days
 
 
 def calendar_accrual(market, at):
@@ -672,88 +695,119 @@ def reconstruct_month(state, markets, histories, month_start, today):
     return rows
 
 
-def previous_snapshot(connection, chat_id, today, current, include_today=False):
-    # A reconstructed close is preferable to a morning observation for "today".
-    archived = connection.execute('SELECT data FROM investment_daily_history WHERE chat_id=? AND day=?',
-                                  (chat_id, (today - timedelta(days=1)).isoformat())).fetchone()
-    if archived:
-        data = json.loads(archived[0])
-        if data.get('complete') and data['ledger'] == current['ledger'] and data.get('nkd_basis') == current.get('nkd_basis'):
-            return data
-    row = connection.execute('''SELECT data FROM investment_daily_snapshots WHERE chat_id=? AND day<=?
-        ORDER BY CASE WHEN day<? THEN 0 ELSE 1 END, day DESC LIMIT 1''',
-        (chat_id, (today if include_today else today-timedelta(days=1)).isoformat(), today.isoformat())).fetchone()
-    return json.loads(row[0]) if row else None
+def daily_accrual(market, on):
+    """RUB earned from the start of on to the start of the following day."""
+    if market.get("schedule_stale"):
+        return None
+    row = coupon_period(market["coupons"], on)
+    value = payment_value(row) if row else None
+    if value is None:
+        return None
+    start, end = day(row["startdate"]), day(row["coupondate"])
+    elapsed = (on - start).days
+    length = (end - start).days
+    before, after = (
+        (value * days / length).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        for days in (elapsed, elapsed + 1)
+    )
+    return after - before
 
 
-def daily_snapshot(state, markets, observed_at):
-    """Persist comparable valuations; imported ledger changes reset the baseline."""
-    observed_day = day(observed_at[:10])
-    calendar_markets = {}
-    for isin, bond in state['bonds'].items():
+def daily_price_change(market, api, isin, on, quantity):
+    """Compare two completed dates on the same MOEX board and nominal basis."""
+    try:
+        rows = api.history(isin, on - timedelta(days=14), on)
+    except (ValueError, OSError):
+        return None, None, None
+    board = market["security"].get("BOARDID")
+    if not board:
+        boards = {r["BOARDID"] for r in rows if str(r.get("BOARDID", "")).startswith("TQ")}
+        board = next(iter(boards)) if len(boards) == 1 else None
+    candidates = sorted(
+        (r for r in rows if board and r.get("BOARDID") == board
+         and r.get("TRADEDATE") and day(r["TRADEDATE"]) <= on
+         and r.get("CLOSE") and r.get("FACEVALUE") and r.get("FACEUNIT") in ("RUB", "SUR")
+         and r.get("NUMTRADES") != 0),
+        key=lambda r: (r["TRADEDATE"], r.get("TRADINGSESSION") == 3, r.get("NUMTRADES") or 0),
+        reverse=True,
+    )
+    current = next(iter(candidates), None)
+    previous = next((r for r in candidates if day(r["TRADEDATE"]) < on), None)
+    if current is None or previous is None:
+        return None, None, None
+    points = dec(current["CLOSE"]) - dec(previous["CLOSE"])
+    impact = points * dec(current["FACEVALUE"]) * quantity / 100
+    quote_days = day(previous["TRADEDATE"]), day(current["TRADEDATE"])
+    return points, impact, quote_days
+
+
+def daily_portfolio_text(state, api, observed_at):
+    at = datetime.fromisoformat(observed_at)
+    if at.tzinfo is not None:
+        at = at.astimezone(ZoneInfo("Europe/Moscow"))
+    on = at.date() - timedelta(days=1)
+    quantities = {isin: dec(bond["quantity"]) for isin, bond in state["bonds"].items()}
+    pending = [trade for trade in state.get("pending_trades", []) if day(trade["settled"]) <= on]
+    for trade in pending:
+        quantities[trade["isin"]] += dec(trade["quantity"])
+    held = {isin: qty for isin, qty in quantities.items() if qty > 0}
+    markets = api.all(list(held))
+    lines = [f"Облигации за {on:%d.%m.%Y}"]
+    positions = f"Позиции по отчёту на {state['asof']:%d.%m.%Y}"
+    if pending:
+        positions += " с учётом плановых расчётов"
+    if not held:
+        return "\n".join([*lines, "Открытых позиций нет.", positions + "."])
+
+    def value_position(isin):
         m = markets[isin]
-        nkd = calendar_accrual(m, observed_day) if dec(bond['quantity']) else Decimal(0)
-        if nkd is None:
-            raise ValueError('Нет купонного графика для НКД на сегодня: ' + bond['name'] + '. Дневное изменение не рассчитано.')
-        calendar_markets[isin] = dict(m, security=dict(m['security'], ACCRUEDINT=nkd))
-    markets = calendar_markets
-    cash, unmatched = cash_by_bond(state, markets)
-    calculated = [results(b, markets[i], cash[i]) for i, b in state['bonds'].items()]
-    if any(r['value'] is None for r in calculated):
-        raise ValueError('Не удалось получить цены всех бумаг. Изменение портфеля не рассчитано.')
-    if any(m['stale'] for i, m in markets.items() if dec(state['bonds'][i]['quantity']) > 0):
-        raise ValueError('MOEX не обновил цены. Чтобы не показать ложное изменение, сегодня сравнение пропущено.')
-    value = sum((r['value'] for r in calculated), Decimal(0))
-    nkd = sum((dec(b['quantity']) * dec(markets[i]['security'].get('ACCRUEDINT') or 0) for i, b in state['bonds'].items()), Decimal(0))
-    fingerprint = ledger_fingerprint(state)
-    total = sum((r['total'] for r in calculated), Decimal(0)) if not unmatched and all(r['total'] is not None for r in calculated) else None
-    pending = []
-    for isin, bond in state['bonds'].items():
-        if dec(bond['quantity']) <= 0:
-            continue
-        m = markets[isin]
-        for rows, key in ((m['coupons'], 'coupondate'), (m['amortizations'], 'amortdate')):
-            for event in rows:
-                if event.get(key) and state['asof'] < day(event[key]) <= observed_day:
-                    pending.append((event[key], bond['name']))
-    return {'observed_at': observed_at, 'nkd_basis': 'calendar_v1', 'ledger': fingerprint, 'asof': str(state['asof']),
-            'value': str(value), 'price': str(value - nkd), 'nkd': str(nkd),
-            'total': str(total) if total is not None else None,
-            'coupons': str(sum((r['coupons'] for r in calculated), Decimal(0))),
-            'fees': str(sum((r['fees'] for r in calculated), Decimal(0))),
-            'principal': str(sum((r['principal'] for r in calculated), Decimal(0))),
-            'pending': sorted(set(pending)),
-            'quote_at': sorted({m['quote_at'] for i, m in markets.items() if m['quote_at'] and dec(state['bonds'][i]['quantity']) > 0}),
-            **ledger_totals(state, state['asof'])}
+        qty = held[isin]
+        maturity = m["security"].get("MATDATE") or m["description"].get("MATDATE")
+        if maturity and maturity != "0000-00-00" and day(maturity) <= on:
+            return None
+        points, impact, quote_days = daily_price_change(m, api, isin, on, qty)
+        accrued = daily_accrual(m, on)
+        return qty, points, impact, quote_days, accrued * qty if accrued is not None else None
 
-
-def yesterday_valuation(state, markets, market, today):
-    """Reprice today's holdings on yesterday, without snapshot/version gates."""
-    yesterday = today - timedelta(days=1)
-    held = [(i, b) for i, b in state['bonds'].items() if dec(b['quantity']) > 0]
-    def value_position(item):
-        isin, bond = item
-        m = markets[isin]
-        rows = market.history(isin, yesterday - timedelta(days=40), yesterday)
-        board = m['security'].get('BOARDID')
-        candidates = [r for r in rows if r.get('TRADEDATE') and day(r['TRADEDATE']) <= yesterday
-                      and (r.get('BOARDID') == board if board else str(r.get('BOARDID','')).startswith('TQ'))
-                      and r.get('CLOSE') is not None and r.get('FACEVALUE') is not None and r.get('FACEUNIT') in ('RUB','SUR')]
-        if not candidates:
-            raise ValueError('Нет архивной цены за вчера: ' + bond['name'])
-        quote = max(candidates, key=lambda r:(r['TRADEDATE'],r.get('TRADINGSESSION') == 3,r.get('NUMTRADES') or 0))
-        accrued = calendar_accrual(m, yesterday)
-        if accrued is None:
-            raise ValueError('Нет графика для НКД за вчера: ' + bond['name'])
-        qty = dec(bond['quantity'])
-        return qty * dec(quote['CLOSE']) / 100 * dec(quote['FACEVALUE']), qty * accrued, quote['TRADEDATE']
     with ThreadPoolExecutor(max_workers=4) as pool:
         values = list(pool.map(value_position, held))
-    price = sum((v[0] for v in values),Decimal(0))
-    nkd = sum((v[1] for v in values),Decimal(0))
-    return {'source':'same_holdings_yesterday','observed_at':yesterday.isoformat()+'T23:59:59+03:00',
-            'nkd_basis':'calendar_v1','ledger':ledger_fingerprint(state),'value':str(price+nkd),
-            'price':str(price),'nkd':str(nkd),'quote_at':sorted({v[2] for v in values})}
+
+    def signed(value):
+        if value is None:
+            return "нет данных"
+        return ("+" if value > 0 else "") + rub(value)
+
+    def total(amounts):
+        known = [amount for amount in amounts if amount is not None]
+        if len(known) == len(amounts):
+            return signed(sum(known, Decimal(0)))
+        if known:
+            return f"{signed(sum(known, Decimal(0)))} по {len(known)} из {len(amounts)} выпусков"
+        return "нет данных"
+
+    details, matured, prices, accruals = [], [], [], []
+    for isin, value in zip(held, values):
+        name = state["bonds"][isin]["name"]
+        if value is None:
+            matured.append(name)
+            continue
+        qty, points, impact, quote_days, accrued = value
+        prices.append(impact)
+        accruals.append(accrued)
+        price_text = "цена: нет данных"
+        if points is not None:
+            price_text = f"{points:+.2f} п.п. ({signed(impact)})" if points else f"0 п.п. ({signed(impact)})"
+            if quote_days != (on - timedelta(days=1), on):
+                price_text += (f" · котировка {quote_days[1]:%d.%m}" if quote_days[0] == quote_days[1]
+                               else f" · {quote_days[0]:%d.%m} → {quote_days[1]:%d.%m}")
+        details.append(f"• {name} × {qty.normalize():f} · {price_text} · НКД {signed(accrued)}")
+
+    lines += [f"Начислено НКД за день: {total(accruals)}",
+              f"Изменение чистых цен: {total(prices)}", "", *details]
+    if matured:
+        lines.append("Погашение по графику: " + ", ".join(matured) + ".")
+    lines += ["", positions + ". Цены закрытия MOEX, НКД по купонному графику."]
+    return "\n".join(lines)
 
 
 def coupon_income_per_day(state, markets, observed_at):
@@ -775,9 +829,7 @@ def coupon_income_per_day(state, markets, observed_at):
         elif m.get('schedule_stale'):
             entry['reason'] = 'Не удалось обновить купонный график'
         else:
-            periods = [r for r in m['coupons'] if r.get('startdate') and r.get('coupondate')
-                       and day(r['startdate']) <= on < day(r['coupondate'])]
-            row = periods[0] if len(periods) == 1 else None
+            row = coupon_period(m['coupons'], on)
             value = payment_value(row) if row else None
             if row is None or value is None:
                 entry['reason'] = 'Неизвестен купон или текущий купонный период'
@@ -827,52 +879,6 @@ def daily_income_text(data, argument=''):
     at = datetime.fromisoformat(data['observed_at'])
     lines.extend(['', f"Расчёт полного дня, до комиссий и налогов. Обновлено {at:%d.%m %H:%M}; количество бумаг по отчёту на {day(data['asof']):%d.%m}.",
                   'Деньги поступают в даты купонов, а не каждый день.'])
-    return '\n'.join(lines)
-
-
-def daily_change_text(current, previous):
-    def money(value):
-        return rub(value).replace('.00 ₽', ' ₽')
-
-    def signed(value):
-        return ('+' if dec(value) > 0 else '') + money(value)
-
-    at = datetime.fromisoformat(current['observed_at'])
-    months = ('января', 'февраля', 'марта', 'апреля', 'мая', 'июня', 'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря')
-    adjacent = previous is not None and (at.date() - day(previous['observed_at'][:10])).days == 1
-    comparable = previous is not None and adjacent and all(previous.get(k) is not None for k in ('value','price','nkd'))
-    lines = [f'{at.day} {months[at.month - 1]} · портфель',
-             f"Было {money(previous['value']) if comparable else '—'} → стало {money(current['value'])}"]
-    def change(key):
-        return dec(current[key]) - dec(previous[key]) if comparable and key in previous and key in current else Decimal(0)
-    price_change = change('price')
-    nkd_change = change('nkd')
-    income = current.get('daily_income')
-    if income is not None:
-        rate = income['total']
-        return '\n'.join([lines[0],
-            f"Цена бумаг: {money(previous['price']) if comparable else '—'} → {money(current['price'])}",
-            f"Цена: {signed(price_change) if comparable else 'нет данных'} · НКД/день: {signed(rate) if rate is not None else 'нет данных'}",
-            'По каждой бумаге: /daily_income',
-            f"Итого за день (расчёт): {signed(price_change + dec(rate)) if comparable and rate is not None else 'нет полного расчёта'}"])
-    if comparable:
-        lines.append(f"Цена: {signed(price_change)} · НКД: {signed(nkd_change)}")
-    else:
-        lines.append('Цена: — · НКД: — (нет сравнения)')
-    if comparable:
-        lines.append(f"НКД: {money(previous['nkd'])} → {money(current['nkd'])}")
-    else:
-        lines.append(f"НКД сейчас: {money(current['nkd'])}")
-    pending = [e for e in current['pending'] if not previous or e[0] > previous['observed_at'][:10]]
-    if not comparable:
-        if previous:
-            lines.append('Итого: — · нет оценки за вчера, изменение за сутки недоступно')
-        else:
-            lines.append('Итого: — · первая оценка, сравнение со следующей сводки')
-    else:
-        if pending:
-            lines[3] += ' · выплата по графику отдельно'
-        lines.append(f"Итого за день: {signed(price_change + nkd_change)}")
     return '\n'.join(lines)
 
 
@@ -993,18 +999,12 @@ def report_text(connection, chat_id, command, argument, today, market, detailed=
         if len(matches) > 1:
             return "Выбери выпуск:", {"inline_keyboard": [[{"text": bonds[i]["name"], "callback_data": "investbond:" + i}] for i in matches]}
         bonds = {matches[0]: bonds[matches[0]]}
-    markets = market.all(list(state["bonds"]))
     timestamp = observed_at or today.isoformat() + 'T10:00:00'
+    if command == '/portfolio_day':
+        return daily_portfolio_text(state, market, timestamp), MENU
+    markets = market.all(list(state["bonds"]))
     if command == '/daily_income':
         return daily_income_text(hourly_income(connection, chat_id, state, markets, timestamp), argument), MENU
-    if command == '/portfolio_day':
-        current = daily_snapshot(state, markets, observed_at or today.isoformat() + 'T10:00:00')
-        current['daily_income'] = hourly_income(connection, chat_id, state, markets, timestamp)
-        previous = yesterday_valuation(state, markets, market, today)
-        if previous is None:
-            connection.execute('INSERT OR IGNORE INTO investment_daily_snapshots VALUES (?,?,?)',
-                               (chat_id, today.isoformat(), json.dumps(current, ensure_ascii=False)))
-        return daily_change_text(current, previous), MENU
     cash, unmatched = cash_by_bond(state, markets)
     if command == "/pnl" or (command == "/profit" and not detailed):
         return pnl_text(state, markets, cash, unmatched), {"inline_keyboard": [[{"text": "Подробнее по каждой облигации", "callback_data": "investdetail:profit:"}]]}

@@ -3061,6 +3061,7 @@ def send_daily_profit(user, day):
 
 
 INVESTMENT_DAILY_PENDING = set()
+INVESTMENT_DAILY_RETRY_AFTER = {}
 INVESTMENT_HISTORY_PENDING = set()
 INVESTMENT_INCOME_PENDING = set()
 
@@ -3187,30 +3188,21 @@ def dispatch_portfolio_history():
     queue_portfolio_history(chat_id, month_start, user_calendar_today(user), key)
 
 
-def investment_daily_worker(chat_id, today, observed_at, notify=True):
+def investment_daily_worker(chat_id, today, observed_at):
     try:
         with db() as connection:
             state = investments.portfolio(connection, chat_id)
         if not state:
             return
-        market = investments.Market(db)
-        markets = market.all(list(state['bonds']))
-        snapshot = investments.daily_snapshot(state, markets, observed_at)
-        previous = investments.yesterday_valuation(state, markets, market, today) if notify else None
+        result = investments.daily_portfolio_text(state, investments.Market(db), observed_at)
         with db() as connection:
-            snapshot['daily_income'] = investments.hourly_income(connection, chat_id, state, markets, observed_at)
-            connection.execute('INSERT INTO investment_daily_snapshots VALUES (?,?,?) ON CONFLICT(chat_id,day) DO UPDATE SET data=excluded.data',
-                               (chat_id, today.isoformat(), json.dumps(snapshot, ensure_ascii=False)))
-        print('Investment daily snapshot saved:', today.isoformat(), flush=True)
-        if notify and send(chat_id, investments.daily_change_text(snapshot, previous), investments.MENU) is not None:
+            if investments.portfolio(connection, chat_id) != state:
+                return  # A newer report was imported while MOEX requests were in flight.
+        if send_investment_text(chat_id, result, investments.MENU):
             mark_sent(chat_id, today, 'investment_daily')
-    except ValueError as error:
-        if notify and send(chat_id, 'Портфель · утренняя сводка\n' + str(error)) is not None:
-            mark_sent(chat_id, today, 'investment_daily')
+            print('Investment daily delivered:', today.isoformat(), flush=True)
     except Exception as error:
         print('Investment daily failed:', type(error).__name__, flush=True)
-        if notify and send(chat_id, 'Не удалось обновить утреннюю сводку портфеля. Последние цифры можно посмотреть через /pnl.') is not None:
-            mark_sent(chat_id, today, 'investment_daily')
     finally:
         with INVESTMENT_LOCK:
             INVESTMENT_DAILY_PENDING.discard(chat_id)
@@ -3218,22 +3210,22 @@ def investment_daily_worker(chat_id, today, observed_at, notify=True):
 
 def schedule_investment_daily(user, local_now):
     chat_id = user['chat_id']
-    if chat_id not in ALLOWED_USER_IDS:
+    if chat_id not in ALLOWED_USER_IDS or local_now.hour < 10:
         return
     today = local_now.date()
+    if was_sent(chat_id, today, 'investment_daily'):
+        return
     with db() as connection:
         if not connection.execute('SELECT 1 FROM investment_reports WHERE chat_id=? LIMIT 1', (chat_id,)).fetchone():
             return
-        baseline = connection.execute('SELECT 1 FROM investment_daily_snapshots WHERE chat_id=? LIMIT 1', (chat_id,)).fetchone()
-    notify = local_now.hour == 10 and local_now.minute < 5
-    if (not notify and baseline) or (notify and was_sent(chat_id, today, 'investment_daily')):
-        return
+    now = time.monotonic()
     with INVESTMENT_LOCK:
-        if chat_id in INVESTMENT_DAILY_PENDING:
+        if chat_id in INVESTMENT_DAILY_PENDING or now < INVESTMENT_DAILY_RETRY_AFTER.get(chat_id, 0):
             return
         INVESTMENT_DAILY_PENDING.add(chat_id)
+        INVESTMENT_DAILY_RETRY_AFTER[chat_id] = now + 300
     try:
-        INVESTMENT_WORKERS.submit(investment_daily_worker, chat_id, today, local_now.isoformat(timespec='seconds'), notify)
+        INVESTMENT_WORKERS.submit(investment_daily_worker, chat_id, today, local_now.isoformat(timespec='seconds'))
     except Exception:
         with INVESTMENT_LOCK:
             INVESTMENT_DAILY_PENDING.discard(chat_id)

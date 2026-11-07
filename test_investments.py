@@ -348,10 +348,8 @@ class InvestmentsTest(unittest.TestCase):
             self.assertEqual(c.execute('SELECT COUNT(*) FROM investment_daily_history WHERE chat_id=1').fetchone()[0],3)
             self.assertEqual(c.execute('SELECT COUNT(*) FROM investment_daily_history WHERE chat_id=2').fetchone()[0],0)
             self.assertEqual(c.execute('SELECT data FROM investment_daily_snapshots').fetchone()[0],'real observation')
-            current={'ledger':inv.ledger_fingerprint(self.state()), 'nkd_basis':'calendar_v1'}
-            previous=inv.previous_snapshot(c,1,date(2026,10,4),current)
-            self.assertEqual(previous['source'],'moex_history_close')
-            self.assertEqual(previous['day'],'2026-10-03')
+            saved = c.execute("SELECT data FROM investment_daily_history WHERE chat_id=1 AND day='2026-10-03'").fetchone()
+            self.assertEqual(json.loads(saved[0])['source'], 'moex_history_close')
 
     def test_history_redemption_and_coupon_are_not_false_losses(self):
         self.save(report(qty='0', end='2026-10-03', cash=[payment(kind='principal', amount='2000', when='2026-10-02'), payment(amount='30', when='2026-10-02', identity='coupon')]))
@@ -425,52 +423,6 @@ class InvestmentsTest(unittest.TestCase):
             finally:
                 bot.INVESTMENT_INCOME_PENDING.discard(1)
 
-    def test_daily_price_and_nkd_changes_reconcile(self):
-        self.save(report(cash=[payment()]))
-        state = self.state(); m = market()
-        first = inv.daily_snapshot(state, {ISIN: m}, '2026-10-01T10:00:00+07:00')
-        m['price'] = 97; m['security']['ACCRUEDINT'] = 12
-        second = inv.daily_snapshot(state, {ISIN: m}, '2026-10-02T10:00:00+07:00')
-        text = inv.daily_change_text(second, first)
-        self.assertIn('Итого за день: -18.02 ₽', text)
-        self.assertIn('Цена: -20 ₽ · НКД: +1.98 ₽', text)
-        self.assertEqual(len(text.splitlines()), 5)
-        self.assertEqual(second['ledger'], first['ledger'])
-
-    def test_daily_history_change_does_not_reset_comparison(self):
-        self.save()
-        first = inv.daily_snapshot(self.state(), {ISIN: market()}, '2026-10-01T10:00:00+07:00')
-        self.save(report(end='2026-10-01', cash=[payment()]), digest='new')
-        second = inv.daily_snapshot(self.state(), {ISIN: market()}, '2026-10-02T10:00:00+07:00')
-        text = inv.daily_change_text(second, first)
-        self.assertIn('Итого за день:', text)
-        self.assertNotIn('новая точка отсчёта', text)
-        self.assertNotIn('Изменение оценки с', text)
-        self.assertEqual(len(text.splitlines()), 5)
-
-    def test_daily_nkd_ignores_settlement_jump_for_127k_portfolio(self):
-        self.save(report(qty='127', trades=[trade(qty='127', amount='127000')]))
-        m = market()
-        m['coupons'] = [{'startdate':'2026-10-01', 'coupondate':'2026-10-31',
-                         'value':'16.44', 'faceunit':'RUB'}]
-        m['security'].update(ACCRUEDINT='8.22', SETTLEDATE='2026-10-16')
-        first = inv.daily_snapshot(self.state(), {ISIN:m}, '2026-10-15T10:00:00+07:00')
-        m['security'].update(ACCRUEDINT='10.41', SETTLEDATE='2026-10-20')
-        second = inv.daily_snapshot(self.state(), {ISIN:m}, '2026-10-16T10:00:00+07:00')
-        self.assertEqual(Decimal(second['nkd']) - Decimal(first['nkd']), Decimal('69.85'))
-        self.assertIn('НКД: +69.85 ₽', inv.daily_change_text(second, first))
-        # Daily-only normalization must not modify MOEX data used by /pnl.
-        self.assertEqual(m['security']['ACCRUEDINT'], '10.41')
-
-    def test_daily_nkd_accrues_on_weekends_with_unchanged_exchange_quote(self):
-        self.save()
-        m = market()
-        m['coupons'][1]['value'] = 91
-        snapshots = [inv.daily_snapshot(self.state(), {ISIN:m}, f'2026-10-{d}T10:00:00+07:00')
-                     for d in (16,17,18)]
-        for previous, current in zip(snapshots, snapshots[1:]):
-            self.assertEqual(Decimal(current['nkd']) - Decimal(previous['nkd']), Decimal('2'))
-
     def test_archived_weekend_nkd_uses_calendar_not_carried_trade_date(self):
         self.save(report(end='2026-10-18'))
         m = market()
@@ -482,142 +434,98 @@ class InvestmentsTest(unittest.TestCase):
         self.assertEqual([Decimal(r['nkd']) for r in rows], [Decimal(30), Decimal(32), Decimal(34)])
         self.assertTrue(rows[-1]['carried_quotes'])
 
-    def test_daily_coupon_reset_is_not_multiple_days_of_income(self):
-        self.save()
+    def test_daily_report_uses_closes_and_calendar_accrual_independently(self):
+        self.save(report(qty='127', trades=[trade(qty='127', amount='127000')]))
         m = market()
-        previous = inv.daily_snapshot(self.state(), {ISIN:m}, '2026-09-30T10:00:00+07:00')
-        current = inv.daily_snapshot(self.state(), {ISIN:m}, '2026-10-01T10:00:00+07:00')
-        self.assertEqual(Decimal(previous['nkd']), Decimal('58'))
-        self.assertEqual(Decimal(current['nkd']), Decimal('0'))
-        text = inv.daily_change_text(current, previous)
-        self.assertIn('НКД: -58 ₽', text)
-        self.assertIn('выплата по графику отдельно', text)
-
-    def test_daily_unknown_coupon_and_stale_schedule_do_not_guess(self):
-        self.save()
-        for unknown in (True, False):
-            m = market()
-            if unknown:
-                m['coupons'][1]['value'] = None
-            else:
-                m['schedule_stale'] = True
-            with self.assertRaisesRegex(ValueError, 'Нет купонного графика'):
-                inv.daily_snapshot(self.state(), {ISIN:m}, '2026-10-02T10:00:00+07:00')
-
-    def test_daily_old_basis_and_missing_yesterday_reset_comparison(self):
-        self.save()
-        previous = inv.daily_snapshot(self.state(), {ISIN:market()}, '2026-10-01T10:00:00+07:00')
-        current = inv.daily_snapshot(self.state(), {ISIN:market()}, '2026-10-02T10:00:00+07:00')
-        legacy = dict(previous)
-        legacy.pop('nkd_basis')
-        self.assertIn('Итого за день:', inv.daily_change_text(current, legacy))
-        current['observed_at'] = '2026-10-04T10:00:00+07:00'
-        text = inv.daily_change_text(current, previous)
-        self.assertIn('нет оценки за вчера', text)
-        self.assertNotIn('Итого за день:', text)
-
-    def test_daily_first_and_unconfirmed_payments_are_explicit(self):
-        self.save()
-        first = inv.daily_snapshot(self.state(), {ISIN: market()}, '2026-10-01T10:00:00+07:00')
-        text = inv.daily_change_text(first, None)
-        self.assertIn('первая оценка', text)
-        self.assertIn('НКД сейчас:', text)
-        self.assertEqual(len(text.splitlines()), 5)
-        self.assertNotIn('Изменение оценки с', text)
-
-    def test_compact_daily_fresh_history_and_pending_payments(self):
-        self.save()
-        first = inv.daily_snapshot(self.state(), {ISIN:market()}, '2026-10-01T10:00:00+07:00')
-        current = dict(first, observed_at='2026-10-02T10:00:00+07:00', asof='2026-10-02', pending=[])
-        text = inv.daily_change_text(current, first)
-        self.assertEqual(len(text.splitlines()), 5)
-        self.assertIn('2 октября · портфель', text)
-        self.assertIn('НКД: 0 ₽ → 0 ₽', text)
-        self.assertIn('Итого за день: 0 ₽', text)
-        current['pending'] = [('2026-10-02','Тест')]
-        current['asof'] = '2026-09-30'
-        text = inv.daily_change_text(current, first)
-        self.assertEqual(len(text.splitlines()), 5)
-        self.assertIn('выплата по графику отдельно', text)
-        self.assertNotIn('Купоны: 0', text)
-
-    def test_daily_missing_or_stale_quotes_not_zero(self):
-        self.save(); m = market()
-        m['stale'] = True
-        with self.assertRaises(ValueError):
-            inv.daily_snapshot(self.state(), {ISIN: m}, '2026-10-01T10:00:00+07:00')
-        m['stale'] = False; m['price'] = None
-        with self.assertRaises(ValueError):
-            inv.daily_snapshot(self.state(), {ISIN: m}, '2026-10-01T10:00:00+07:00')
-
-    def test_daily_worker_persists_baseline_and_sends_only_when_requested(self):
-        self.save()
-        with patch.object(inv.Market, 'all', return_value={ISIN: market()}), patch.object(inv.Market, 'history', return_value=[history_quote()]), patch.object(bot, 'send', return_value={'message_id': 1}) as send:
-            bot.investment_daily_worker(1, date(2026,10,1), '2026-10-01T15:00:00+07:00', False)
-            send.assert_not_called()
-            bot.investment_daily_worker(1, date(2026,10,2), '2026-10-02T10:00:00+07:00')
-            self.assertTrue(bot.was_sent(1, date(2026,10,2), 'investment_daily'))
-            self.assertIn('Итого за день (расчёт):', send.call_args.args[1])
-            self.assertEqual(len(send.call_args.args[1].splitlines()), 5)
+        m['security'].update(ACCRUEDINT='10.41', SETTLEDATE='2026-10-20', BOARDID='TQCB')
+        m['price'] = 101
+        m['coupons'] = [{'startdate': '2026-10-01', 'coupondate': '2026-10-31',
+                         'value': '16.44', 'faceunit': 'RUB'}]
+        # The nominal shrank, the price rose by 1 p.p. on the remaining nominal.
+        quotes = [history_quote('2026-10-14', 98), history_quote('2026-10-15', 99, face=800),
+                  history_quote('2026-10-16', 85)]
+        api = SimpleNamespace(all=lambda _: {ISIN: m}, history=lambda *args: quotes)
         with self.db() as c:
-            self.assertEqual(c.execute('SELECT COUNT(*) FROM investment_daily_snapshots WHERE chat_id=1').fetchone()[0], 2)
-            self.assertEqual(c.execute('SELECT COUNT(*) FROM investment_daily_snapshots WHERE chat_id=2').fetchone()[0], 0)
+            text, keyboard = inv.report_text(c, 1, '/portfolio_day', '', date(2026, 10, 16), api)
+        self.assertIn('Облигации за 15.10.2026', text)
+        self.assertIn('Изменение чистых цен: +1 016.00 ₽', text)
+        self.assertIn('Начислено НКД за день: +69.85 ₽', text)
+        self.assertIn('+1.00 п.п.', text)
+        self.assertEqual(keyboard, inv.MENU)
+        self.assertFalse(bot.was_sent(1, date(2026, 10, 16), 'investment_daily'))
 
-    def test_daily_scheduler_uses_local_ten_and_deduplicates(self):
-        self.save(); user={'chat_id':1}
-        with self.db() as c:
-            c.execute('INSERT INTO investment_daily_snapshots VALUES (?,?,?)', (1,'2026-09-30','{}'))
-        with patch.object(bot, 'ALLOWED_USER_IDS', {1}), patch.object(bot.INVESTMENT_WORKERS, 'submit') as submit:
+    def test_daily_accrual_at_coupon_boundary_uses_the_earned_day(self):
+        m = market()
+        self.assertEqual(inv.daily_accrual(m, date(2026, 9, 30)), Decimal('1.00'))
+        self.assertEqual(inv.daily_accrual(m, date(2026, 10, 1)), Decimal('0.99'))
+        m['coupons'][1]['value'] = None
+        self.assertIsNone(inv.daily_accrual(m, date(2026, 10, 1)))
+        self.assertEqual(inv.daily_accrual(m, date(2026, 9, 30)), Decimal('1.00'))
+
+    def test_daily_weekend_carries_last_price_and_counts_calendar_accrual(self):
+        self.save()
+        api = SimpleNamespace(all=lambda _: {ISIN: market()}, history=lambda *args: [history_quote('2026-10-16')])
+        text = inv.daily_portfolio_text(self.state(), api, '2026-10-18T10:00:00+07:00')
+        self.assertIn('Изменение чистых цен: 0.00 ₽', text)
+        self.assertIn('котировка 16.10', text)
+        self.assertIn('Начислено НКД за день: +1.98 ₽', text)
+
+    def test_daily_missing_data_is_local_to_the_metric_and_issue(self):
+        other = 'RU000A10BS76'
+        r = report()
+        r['bonds'][other] = dict(r['bonds'][ISIN], name='Тест 02')
+        self.save(r)
+        unknown_coupon = market()
+        unknown_coupon['schedule_stale'] = True
+        def history(isin, start, end):
+            if isin == other:
+                raise ValueError('MOEX unavailable')
+            return [history_quote('2026-10-14'), history_quote('2026-10-15', 99)]
+        api = SimpleNamespace(all=lambda _: {ISIN: unknown_coupon, other: market()}, history=history)
+        text = inv.daily_portfolio_text(self.state(), api, '2026-10-16T10:00:00+07:00')
+        self.assertIn('Изменение чистых цен: +20.00 ₽ по 1 из 2 выпусков', text)
+        self.assertIn('Начислено НКД за день: +1.98 ₽ по 1 из 2 выпусков', text)
+        self.assertIn('Тест 02 × 2 · цена: нет данных', text)
+
+    def test_daily_pending_settlement_is_counted_only_from_its_date(self):
+        self.save(report(qty='0', trades=[]))
+        state = self.state()
+        state['pending_trades'] = [{'isin': ISIN, 'settled': '2026-10-02', 'quantity': '16'}]
+        api = SimpleNamespace(all=lambda _: {ISIN: market()}, history=lambda *args: [])
+        self.assertIn('Открытых позиций нет', inv.daily_portfolio_text(state, api, '2026-10-02T10:00:00+07:00'))
+        text = inv.daily_portfolio_text(state, api, '2026-10-03T10:00:00+07:00')
+        self.assertIn('Тест 01 × 16', text)
+        self.assertIn('с учётом плановых расчётов', text)
+
+    def test_daily_worker_marks_sent_only_after_delivery(self):
+        self.save()
+        today = date(2026, 10, 2)
+        observed_at = '2026-10-02T10:00:00+07:00'
+        with patch.object(inv.Market, 'all', return_value={ISIN: market()}), patch.object(inv.Market, 'history', return_value=[]), patch.object(bot, 'send', side_effect=[None, {'message_id': 1}]) as send:
+            bot.investment_daily_worker(1, today, observed_at)
+            self.assertFalse(bot.was_sent(1, today, 'investment_daily'))
+            bot.investment_daily_worker(1, today, observed_at)
+            self.assertTrue(bot.was_sent(1, today, 'investment_daily'))
+            self.assertIn('Начислено НКД за день: +1.98 ₽', send.call_args.args[1])
+            self.assertIn('Изменение чистых цен: нет данных', send.call_args.args[1])
+
+    def test_daily_scheduler_catches_up_after_restart_and_deduplicates(self):
+        self.save()
+        user = {'chat_id': 1}
+        with patch.object(bot, 'ALLOWED_USER_IDS', {1}), patch.object(bot, 'INVESTMENT_DAILY_RETRY_AFTER', {}), patch.object(bot.INVESTMENT_WORKERS, 'submit') as submit:
             try:
                 bot.schedule_investment_daily(user, datetime.fromisoformat('2026-10-01T09:59:00+07:00'))
                 submit.assert_not_called()
-                bot.schedule_investment_daily(user, datetime.fromisoformat('2026-10-01T10:00:00+07:00'))
-                bot.schedule_investment_daily(user, datetime.fromisoformat('2026-10-01T10:01:00+07:00'))
-                self.assertEqual(submit.call_count, 1)
-                self.assertTrue(submit.call_args.args[-1])
+                late = datetime.fromisoformat('2026-10-01T10:22:00+07:00')
+                bot.schedule_investment_daily(user, late)
+                bot.schedule_investment_daily(user, late)
+                submit.assert_called_once_with(bot.investment_daily_worker, 1, late.date(), late.isoformat())
                 bot.INVESTMENT_DAILY_PENDING.discard(1)
-                bot.mark_sent(1,date(2026,10,1),'investment_daily')
-                bot.schedule_investment_daily(user, datetime.fromisoformat('2026-10-01T10:02:00+07:00'))
+                bot.mark_sent(1, late.date(), 'investment_daily')
+                bot.schedule_investment_daily(user, late)
                 self.assertEqual(submit.call_count, 1)
             finally:
                 bot.INVESTMENT_DAILY_PENDING.discard(1)
-
-    def test_yesterday_is_calculated_even_when_saved_snapshot_has_old_basis(self):
-        self.save(report(end='2026-10-16'))
-        m=market();m['price']=99;m['security']['ACCRUEDINT']=999
-        m['coupons'][1]['value']=91
-        api=SimpleNamespace(all=lambda _: {ISIN:m},history=lambda *args:[history_quote('2026-10-16',98,999)])
-        with self.db() as c:
-            c.execute('INSERT INTO investment_daily_snapshots VALUES (?,?,?)',(1,'2026-10-17',json.dumps({'ledger':'legacy','value':'1','nkd_basis':'old'})))
-            text,_=inv.report_text(c,1,'/portfolio_day','',date(2026,10,18),api,observed_at='2026-10-18T10:00:00+07:00')
-        self.assertIn('Цена бумаг: 1 960 ₽ → 1 980 ₽',text)
-        self.assertIn('Цена: +20 ₽ · НКД/день: +2 ₽',text)
-        self.assertIn('По каждой бумаге: /daily_income',text)
-        self.assertIn('Итого за день (расчёт): +22 ₽',text)
-        self.assertEqual(len(text.splitlines()),5)
-        self.assertNotIn('новая точка отсчёта',text)
-
-    def test_yesterday_missing_archive_is_explicit_error_not_reset(self):
-        self.save();m=market()
-        with self.assertRaisesRegex(ValueError,'Нет архивной цены'):
-            inv.yesterday_valuation(self.state(),{ISIN:m},SimpleNamespace(history=lambda *args:[]),date(2026,10,18))
-
-    def test_manual_daily_report_keeps_baseline_and_schedule_unchanged(self):
-        self.save()
-        first = inv.daily_snapshot(self.state(), {ISIN: market()}, '2026-10-01T10:00:00+07:00')
-        with self.db() as c:
-            c.execute('INSERT INTO investment_daily_snapshots VALUES (?,?,?)', (1,'2026-10-01',json.dumps(first)))
-        m = market(); m['price'] = 99
-        with self.db() as c:
-            text, keyboard = inv.report_text(c, 1, '/portfolio_day', '', date(2026,10,1), SimpleNamespace(all=lambda _: {ISIN:m},history=lambda *args:[history_quote('2026-09-30')]), observed_at='2026-10-01T14:00:00+07:00')
-            saved = json.loads(c.execute('SELECT data FROM investment_daily_snapshots WHERE chat_id=1').fetchone()[0])
-            self.assertEqual(saved, json.loads(json.dumps(first)))
-            self.assertIn('Цена: +20 ₽ · НКД/день: +1.98 ₽', text)
-            self.assertIn('Итого за день (расчёт): +21.98 ₽', text)
-            self.assertIsNotNone(keyboard)
-        self.assertFalse(bot.was_sent(1,date(2026,10,1),'investment_daily'))
-        self.assertEqual(inv.command_text('сводка портфеля'), '/portfolio_day')
-        self.assertEqual(inv.command_text('изменение портфеля'), '/portfolio_day')
 
     def test_preview_dispatch_is_allowlisted_and_persistently_deduplicated(self):
         self.save(); bot.ensure_user(1)
@@ -763,6 +671,9 @@ class ParserTest(unittest.TestCase):
         stock = row(c4='stock', c12='RU0009029540', c14='Сбербанк')
         sheets = {"Динамика позиций": positions, "Завершенные сделки": [header, purchase, repo, closed, stock], " Движение ДС": cash,
                   'Неторговые операции': [()] * 15 + [row(c6='ВУШ БО 001P-02 RU000A106HB4', c10='Аннулирование выпуска WHOOSH001Р02.') ]}
+        sheets["Незавершенные сделки"] = [header,
+            row(c4="pending", c10="01.10.2026", c12=ISIN, c16=16),
+            row(c4="stock-pending", c10="01.10.2026", c12="RU0009029540", c16=3)]
         class Workbook:
             def __iter__(self):
                 return iter([SimpleNamespace(title=k, iter_rows=lambda values_only, rows=v: iter(rows)) for k, v in sheets.items()])
@@ -774,6 +685,7 @@ class ParserTest(unittest.TestCase):
         with patch.dict(sys.modules, {"openpyxl": SimpleNamespace(load_workbook=lambda *a, **k: Workbook())}):
             parsed = inv.parse_alfa(content.getvalue())
         self.assertEqual(len(parsed["trades"]), 2)
+        self.assertEqual(parsed["pending_trades"], [{"isin": ISIN, "settled": "2026-10-01", "quantity": "16"}])
         self.assertEqual(parsed['bonds']['RU000A106HB4']['quantity'], '0')
         self.assertNotIn('RU0009029540', parsed['bonds'])
         self.assertFalse(parsed['warnings'])
